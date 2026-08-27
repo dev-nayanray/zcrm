@@ -5,6 +5,7 @@ import { loginSchema } from "@/lib/validation";
 import { ok, unauthorized, validationError, serverError, tooManyRequests } from "@/lib/api";
 import { readJsonBody, rateLimit, clientIp } from "@/lib/guards";
 import { AuditService } from "@/lib/services/audit";
+import { TwoFactorService } from "@/lib/services/two-factor";
 
 // A fixed decoy password hash used to equalize the timing of the
 // "user-not-found" path with the "wrong-password" path. Without this, a
@@ -72,6 +73,19 @@ export async function POST(request: NextRequest) {
       where: { id: user.id },
       data: { lastLoginAt: new Date(), ...updatedExtra },
     });
+
+    // Telegram-based two-step verification: if enabled, do NOT create a
+    // session yet. Send a one-time code to the user's linked Telegram DM
+    // and hand back a challengeToken the client must verify first.
+    if (user.twoFactorEnabled) {
+      const challenge = await TwoFactorService.createLoginChallenge(user.id);
+      if (!challenge.ok) {
+        return unauthorized(challenge.message);
+      }
+      await AuditService.log({ userId: user.id, action: "LOGIN_2FA_CHALLENGE", entity: "User", entityId: user.id });
+      return ok({ twoFactorRequired: true, challengeToken: challenge.challengeToken });
+    }
+
     await createSession(user.id);
     await AuditService.log({ userId: user.id, action: "LOGIN", entity: "User", entityId: user.id });
 

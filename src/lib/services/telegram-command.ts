@@ -79,6 +79,15 @@ export const TelegramCommandService = {
     // upsert user record from message metadata
     await TelegramService.upsertUser(fromId, { username: msg.from.username, firstName: msg.from.first_name, lastName: msg.from.last_name });
 
+    // Private (1:1) chats are NOT gated by TelegramGroup membership — a
+    // TelegramGroup only exists for team group chats. Account-linking
+    // (for login two-factor auth) and a friendly /start happen here so a
+    // brand-new user DMing the bot doesn't just get silence/"unauthorized",
+    // which is the #1 reason people think the bot is "not working".
+    if (msg.chat.type === "private") {
+      return this.handlePrivateMessage(chatId, fromId, msg);
+    }
+
     const ctx = await this.resolveContext(fromId, chatId, chatTitle);
     if (!ctx) {
       await TelegramService.sendMessage(chatId, this.t("unauthorized", "en"));
@@ -125,6 +134,55 @@ export const TelegramCommandService = {
       await TelegramService.sendMessage(chatId, this.t("unknownCommand", lang));
     }
     return { ok: true, action: "ignored" };
+  },
+
+  // Handle a message sent to the bot in a private (1:1) chat. Not gated by
+  // TelegramGroup membership — used for account linking (2FA) and a
+  // friendly onboarding message.
+  async handlePrivateMessage(chatId: string, fromId: string, msg: any): Promise<{ ok: boolean; action: string }> {
+    const { TwoFactorService } = await import("./two-factor");
+    const text: string = msg.text ?? "";
+    const [cmd, ...args] = text.trim().split(/\s+/);
+    const command = cmd?.toLowerCase();
+
+    if (command === "/start") {
+      await TelegramService.sendMessage(
+        chatId,
+        `👋 <b>Welcome to Z-CRM Bot!</b>\n\n` +
+          `• To use CRM commands (orders, inventory, leads, etc.), ask an admin to add this bot to your team's Telegram group.\n` +
+          `• To enable two-step login verification for your account, go to CRM → Settings → Security → Connect Telegram, then send me the code shown there as:\n<code>/link YOUR_CODE</code>`,
+      );
+      return { ok: true, action: "private_start" };
+    }
+
+    if (command === "/link") {
+      const code = args[0];
+      if (!code) {
+        await TelegramService.sendMessage(chatId, "Usage: <code>/link YOUR_CODE</code>\nGet a code from CRM → Settings → Security → Connect Telegram.");
+        return { ok: true, action: "private_link_usage" };
+      }
+      const result = await TwoFactorService.consumeLinkCode(code, fromId, {
+        username: msg.from.username,
+        firstName: msg.from.first_name,
+        lastName: msg.from.last_name,
+      });
+      await TelegramService.sendMessage(chatId, result.message);
+      return { ok: result.ok, action: "private_link" };
+    }
+
+    if (command === "/unlink") {
+      const linked = await db.telegramUser.findUnique({ where: { telegramId: fromId } });
+      if (linked?.crmUserId) {
+        await TwoFactorService.unlink(linked.crmUserId);
+        await TelegramService.sendMessage(chatId, "🔓 Unlinked. Two-step verification has been disabled for your account.");
+      } else {
+        await TelegramService.sendMessage(chatId, "No linked CRM account found.");
+      }
+      return { ok: true, action: "private_unlink" };
+    }
+
+    await TelegramService.sendMessage(chatId, "❓ Send /start to see what I can do here, or /link YOUR_CODE to connect your CRM account.");
+    return { ok: true, action: "private_unknown" };
   },
 
   async handleCallback(cb: any): Promise<{ ok: boolean; action: string }> {

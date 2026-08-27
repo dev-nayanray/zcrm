@@ -14,9 +14,10 @@ import { toast } from "sonner";
 import { formatDate } from "@/lib/date-range";
 import { ROLES } from "@/lib/constants";
 
-const EVENT_TYPES = ["NEW_ORDER", "NEW_LEAD", "NEW_MESSAGE", "LOW_STOCK", "OUT_OF_STOCK", "PAYMENT_RECEIVED", "DUE_PAYMENT", "DELIVERY_UPDATE", "STOCK_COUNT_APPROVAL", "SYSTEM_ALERT", "PURCHASE_DUE"];
+const EVENT_TYPES = ["CRM_UPDATE", "NEW_ORDER", "NEW_LEAD", "NEW_MESSAGE", "LOW_STOCK", "OUT_OF_STOCK", "PAYMENT_RECEIVED", "DUE_PAYMENT", "DELIVERY_UPDATE", "STOCK_COUNT_APPROVAL", "SYSTEM_ALERT", "PURCHASE_DUE"];
 
 const EVENT_LABELS: Record<string, string> = {
+  CRM_UPDATE: "🔄 Every CRM Update (all creates/edits/deletes)",
   NEW_ORDER: "🆕 New Order", NEW_LEAD: "🎯 New Lead", NEW_MESSAGE: "💬 New Message",
   LOW_STOCK: "⚠️ Low Stock", OUT_OF_STOCK: "🚨 Out of Stock", PAYMENT_RECEIVED: "💰 Payment Received",
   DUE_PAYMENT: "📋 Due Payment", DELIVERY_UPDATE: "🚚 Delivery Update",

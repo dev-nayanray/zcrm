@@ -9,7 +9,7 @@ import { Label } from "@/components/ui/label";
 import { StatusBadge, StatCard } from "../ui";
 import { toast } from "sonner";
 import { formatDate } from "@/lib/date-range";
-import { ShieldCheck, Mail, Phone, Calendar, CreditCard, Wallet, Save, LogOut, Moon, Sun, Bell } from "lucide-react";
+import { ShieldCheck, Mail, Phone, Calendar, CreditCard, Wallet, Save, LogOut, Moon, Sun, Bell, Send, Copy, ShieldAlert } from "lucide-react";
 import { ROLES } from "@/lib/constants";
 
 export function ProfileView() {
@@ -23,6 +23,32 @@ export function ProfileView() {
   const [name, setName] = useState("");
   const [phone, setPhone] = useState("");
   const [newPassword, setNewPassword] = useState("");
+  const [twoFA, setTwoFA] = useState<{ enabled: boolean; linked: boolean; telegramUsername: string | null } | null>(null);
+  const [linkCode, setLinkCode] = useState<{ code: string; botUsername: string | null } | null>(null);
+  const [twoFABusy, setTwoFABusy] = useState(false);
+
+  async function loadTwoFA() {
+    try { setTwoFA(await api.get<any>("/api/v1/auth/2fa/status")); } catch { /* ignore */ }
+  }
+
+  async function generateLinkCode() {
+    setTwoFABusy(true);
+    try {
+      const res = await api.post<any>("/api/v1/auth/2fa/link", {});
+      setLinkCode({ code: res.code, botUsername: res.botUsername });
+    } catch (e) { toast.error((e as Error).message); }
+    finally { setTwoFABusy(false); }
+  }
+
+  async function toggleTwoFA(next: boolean) {
+    setTwoFABusy(true);
+    try {
+      await api.post(`/api/v1/auth/2fa/${next ? "enable" : "disable"}`, {});
+      toast.success(next ? "Two-step verification enabled" : "Two-step verification disabled");
+      await loadTwoFA();
+    } catch (e) { toast.error((e as Error).message); }
+    finally { setTwoFABusy(false); }
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -39,6 +65,7 @@ export function ProfileView() {
         setName(p?.name ?? user?.name ?? ""); setPhone(p?.phone ?? "");
       } catch (e) { toast.error((e as Error).message); }
       finally { if (!cancelled) setLoading(false); }
+      if (!cancelled) await loadTwoFA();
     };
     load();
     return () => { cancelled = true; };
@@ -170,6 +197,52 @@ export function ProfileView() {
               </div>
               <span className="text-xs text-muted-foreground">English</span>
             </div>
+          </CardContent>
+        </Card>
+
+        {/* Security — Telegram two-step verification */}
+        <Card className="shadow-soft card-hover">
+          <CardHeader className="pb-2"><CardTitle className="text-base flex items-center gap-2"><ShieldAlert className="h-4 w-4" /> Security · Telegram Verification</CardTitle></CardHeader>
+          <CardContent className="space-y-3">
+            {twoFA?.linked ? (
+              <>
+                <div className="flex items-center justify-between">
+                  <div>
+                    <p className="text-sm font-medium">Telegram connected</p>
+                    <p className="text-xs text-muted-foreground">{twoFA.telegramUsername ? `@${twoFA.telegramUsername}` : "Linked account"}</p>
+                  </div>
+                  <span className="text-xs text-emerald-600 flex items-center gap-1"><span className="h-1.5 w-1.5 rounded-full bg-emerald-500" /> Linked</span>
+                </div>
+                <div className="flex items-center justify-between pt-1 border-t border-border/60">
+                  <div>
+                    <p className="text-sm font-medium">Two-step verification</p>
+                    <p className="text-xs text-muted-foreground">Require a Telegram code at every login</p>
+                  </div>
+                  <Button variant={twoFA.enabled ? "outline" : "default"} size="sm" disabled={twoFABusy} onClick={() => toggleTwoFA(!twoFA.enabled)}>
+                    {twoFA.enabled ? "Disable" : "Enable"}
+                  </Button>
+                </div>
+              </>
+            ) : (
+              <>
+                <p className="text-xs text-muted-foreground">Connect your Telegram account to enable two-step login verification. Open the bot, then send it the code below.</p>
+                {linkCode ? (
+                  <div className="rounded-lg border border-border/60 bg-muted/40 p-3 space-y-2">
+                    <p className="text-xs text-muted-foreground">Send this to the bot in a private chat:</p>
+                    <div className="flex items-center gap-2">
+                      <code className="flex-1 text-sm font-mono bg-background rounded px-2 py-1 border">/link {linkCode.code}</code>
+                      <Button variant="ghost" size="sm" className="h-8 w-8 p-0" onClick={() => { navigator.clipboard.writeText(`/link ${linkCode.code}`); toast.success("Copied"); }}><Copy className="h-3.5 w-3.5" /></Button>
+                    </div>
+                    {linkCode.botUsername && (
+                      <a className="text-xs text-primary underline" href={`https://t.me/${linkCode.botUsername}`} target="_blank" rel="noreferrer">Open @{linkCode.botUsername} →</a>
+                    )}
+                    <Button variant="outline" size="sm" className="w-full" onClick={loadTwoFA}>I've sent it — refresh status</Button>
+                  </div>
+                ) : (
+                  <Button size="sm" disabled={twoFABusy} onClick={generateLinkCode}><Send className="h-3.5 w-3.5 mr-1" /> Connect Telegram</Button>
+                )}
+              </>
+            )}
           </CardContent>
         </Card>
 

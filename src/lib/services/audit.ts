@@ -4,6 +4,40 @@ import { getCurrentUser } from "@/lib/auth";
 
 type TxClient = Prisma.TransactionClient | PrismaClient;
 
+// Actions that should NOT be broadcast to Telegram as a generic "CRM
+// updated" notification — auth/session noise and anything that could leak
+// sensitive config (bot tokens, secrets).
+const BROADCAST_EXCLUDED_ACTIONS = new Set([
+  "LOGIN", "LOGOUT", "LOGIN_2FA_CHALLENGE",
+  "2FA_ENABLED", "2FA_DISABLED",
+  "TELEGRAM_CONFIG",
+]);
+
+function humanizeAction(action: string): string {
+  return action.replace(/_/g, " ").toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+// Best-effort broadcast of a generic CRM change to any Telegram group
+// subscribed to the "CRM_UPDATE" event. Fire-and-forget: never throws, and
+// is only invoked AFTER the audit row is durably written outside of any
+// in-flight transaction (see log() below) so we never notify about a
+// change that could still be rolled back.
+async function broadcastCrmUpdate(opts: { userId?: string | null; action: string; entity: string; entityId?: string | null }) {
+  if (BROADCAST_EXCLUDED_ACTIONS.has(opts.action)) return;
+  try {
+    const { TelegramService } = await import("./telegram");
+    let who = "";
+    if (opts.userId) {
+      const user = await db.user.findUnique({ where: { id: opts.userId }, select: { name: true } }).catch(() => null);
+      if (user) who = ` by ${user.name}`;
+    }
+    const message = `🔄 <b>CRM Update</b>\n${humanizeAction(opts.action)} — ${opts.entity}${opts.entityId ? ` (${opts.entityId})` : ""}${who}`;
+    await TelegramService.routeNotification("CRM_UPDATE", message);
+  } catch (e) {
+    console.error("[AuditService] broadcastCrmUpdate failed:", e);
+  }
+}
+
 // Audit logging service. All logs are immutable (no update/delete API exposed).
 // When called from inside a service transaction, pass the `tx` client so the
 // audit write happens in the SAME transaction — this avoids SQLite write-lock
@@ -32,6 +66,13 @@ export const AuditService = {
           ipAddress: opts.ipAddress ?? null,
         },
       });
+      // Only broadcast outside a transaction: inside one, the write could
+      // still be rolled back by the caller, and callers already send their
+      // own precise Telegram notifications (order, payment, inventory,
+      // lead) for transactional flows — see routeNotification() call sites.
+      if (!tx) {
+        void broadcastCrmUpdate(opts);
+      }
     } catch (e) {
       // Audit logging must never break the main operation when called
       // outside a transaction. (Inside a transaction, a failure will roll

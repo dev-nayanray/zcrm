@@ -18,7 +18,23 @@ const server = createServer(async (req, res) => {
         return;
       }
 
-      const webhookUrl = 'https://e1k4y76az460-d.space-z.ai/api/v1/integrations/telegram/webhook';
+      // Resolve the webhook URL from (in priority order): an explicit
+      // ?url= query param, the PUBLIC_BASE_URL env var, or the URL already
+      // stored on the bot record. Previously this was hardcoded to a
+      // one-off dev-preview domain (space-z.ai) that the real deployment
+      // never owned, so Telegram updates were silently sent nowhere —
+      // that was the root cause of "the bot doesn't respond".
+      const reqUrl = new URL(req.url ?? '/', `http://localhost:${PORT}`);
+      const overrideUrl = reqUrl.searchParams.get('url');
+      const base = overrideUrl || process.env.PUBLIC_BASE_URL || bot.webhookUrl?.replace(/\/api\/v1\/integrations\/telegram\/webhook$/, '');
+      if (!base) {
+        res.writeHead(400);
+        res.end(JSON.stringify({ error: 'No webhook URL available. Pass ?url=https://your-domain.com or set PUBLIC_BASE_URL.' }));
+        return;
+      }
+      const webhookUrl = base.includes('/api/v1/integrations/telegram/webhook')
+        ? base
+        : `${base.replace(/\/$/, '')}/api/v1/integrations/telegram/webhook`;
       console.log('Setting webhook to:', webhookUrl);
       console.log('Bot token starts with:', bot.botToken.slice(0, 10) + '...');
 

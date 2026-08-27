@@ -7,7 +7,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { toast } from "sonner";
-import { Loader2, ShieldCheck, Eye, EyeOff } from "lucide-react";
+import { Loader2, ShieldCheck, Eye, EyeOff, Send } from "lucide-react";
 
 const DEMO_USERS = [
   { role: "Super Admin", email: "superadmin@zcrm.local", password: "Admin@123" },
@@ -24,23 +24,60 @@ export function LoginScreen() {
   const [password, setPassword] = useState("Admin@123");
   const [showPwd, setShowPwd] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [challengeToken, setChallengeToken] = useState<string | null>(null);
+  const [otp, setOtp] = useState("");
+  const [verifying, setVerifying] = useState(false);
+  const [resending, setResending] = useState(false);
+
+  async function afterLoginSuccess(res: { user: { id: string; name: string; email: string; role: { id: string; name: string } } }) {
+    const me = await api.get<{ permissions: string[] }>("/api/v1/auth/me");
+    setUser({ id: res.user.id, name: res.user.name, email: res.user.email, role: res.user.role.name, permissions: me.permissions });
+    toast.success(`Welcome back, ${res.user.name}!`);
+  }
 
   async function submit(e?: React.FormEvent) {
     e?.preventDefault();
     setLoading(true);
     try {
-      const res = await api.post<{ user: { id: string; name: string; email: string; role: { id: string; name: string } } }>(
-        "/api/v1/auth/login",
-        { email, password },
-      );
-      // fetch permissions
-      const me = await api.get<{ permissions: string[] }>("/api/v1/auth/me");
-      setUser({ id: res.user.id, name: res.user.name, email: res.user.email, role: res.user.role.name, permissions: me.permissions });
-      toast.success(`Welcome back, ${res.user.name}!`);
+      const res = await api.post<any>("/api/v1/auth/login", { email, password });
+      if (res?.twoFactorRequired) {
+        setChallengeToken(res.challengeToken);
+        toast.info("Enter the verification code we sent to your Telegram.");
+        return;
+      }
+      await afterLoginSuccess(res);
     } catch (err) {
       toast.error((err as Error).message || "Login failed");
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function verifyOtp(e?: React.FormEvent) {
+    e?.preventDefault();
+    if (!challengeToken) return;
+    setVerifying(true);
+    try {
+      const res = await api.post<any>("/api/v1/auth/2fa/verify", { challengeToken, code: otp });
+      await afterLoginSuccess(res);
+    } catch (err) {
+      toast.error((err as Error).message || "Invalid code");
+    } finally {
+      setVerifying(false);
+    }
+  }
+
+  async function resendOtp() {
+    if (!challengeToken) return;
+    setResending(true);
+    try {
+      const res = await api.post<any>("/api/v1/auth/2fa/resend", { challengeToken });
+      setChallengeToken(res.challengeToken);
+      toast.success("New code sent to your Telegram.");
+    } catch (err) {
+      toast.error((err as Error).message || "Could not resend code");
+    } finally {
+      setResending(false);
     }
   }
 
@@ -91,6 +128,26 @@ export function LoginScreen() {
             <CardDescription>Enter your credentials to access the CRM.</CardDescription>
           </CardHeader>
           <CardContent>
+            {challengeToken ? (
+              <form onSubmit={verifyOtp} className="space-y-4">
+                <div className="rounded-lg border border-primary/30 bg-primary/5 p-3 text-sm text-muted-foreground flex items-center gap-2">
+                  <Send className="h-4 w-4 text-primary shrink-0" />
+                  We sent a 6-digit verification code to your linked Telegram account.
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="otp">Verification code</Label>
+                  <Input id="otp" inputMode="numeric" maxLength={6} autoFocus value={otp} onChange={(e) => setOtp(e.target.value.replace(/\D/g, ""))} placeholder="123456" className="h-10 tracking-[0.5em] text-center text-lg" required />
+                </div>
+                <Button type="submit" className="w-full h-10 shadow-soft" disabled={verifying || otp.length !== 6}>
+                  {verifying && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
+                  Verify &amp; Sign in
+                </Button>
+                <div className="flex items-center justify-between text-sm">
+                  <button type="button" className="text-muted-foreground hover:text-foreground" onClick={() => { setChallengeToken(null); setOtp(""); }}>← Back to login</button>
+                  <button type="button" className="text-primary font-medium hover:underline disabled:opacity-50" disabled={resending} onClick={resendOtp}>{resending ? "Sending…" : "Resend code"}</button>
+                </div>
+              </form>
+            ) : (
             <form onSubmit={submit} className="space-y-4">
               <div className="space-y-2">
                 <Label htmlFor="email">Email</Label>
@@ -110,10 +167,14 @@ export function LoginScreen() {
                 Sign in
               </Button>
             </form>
+            )}
+            {!challengeToken && (
             <div className="mt-5 pt-4 border-t border-border/40 text-center text-sm">
               New to Z-CRM?{" "}
               <a href="/register" className="text-primary font-medium hover:underline">Create an account</a>
             </div>
+            )}
+            {!challengeToken && (
             <div className="mt-5">
               <div className="flex items-center gap-2 mb-2.5">
                 <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">Demo accounts — click to fill</span>
@@ -133,6 +194,7 @@ export function LoginScreen() {
                 ))}
               </div>
             </div>
+            )}
           </CardContent>
         </Card>
       </div>

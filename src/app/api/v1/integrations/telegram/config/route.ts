@@ -43,7 +43,16 @@ export async function POST(request: NextRequest) {
     const body = await readJsonBody<{ action?: string; url?: string }>(request);
 
     if (body?.action === "setWebhook" || body?.url) {
-      const url = body.url || `https://e1k4y76az460-d.space-z.ai/api/v1/integrations/telegram/webhook`;
+      // NOTE: previously fell back to a hardcoded dev-preview domain
+      // (space-z.ai) when no url was supplied. That silently pointed
+      // Telegram's webhook at a domain the deployment doesn't own,
+      // which is why updates never arrived. The caller (frontend) always
+      // sends window.location.origin, so require an explicit URL here and
+      // fail loudly instead of guessing a domain.
+      const url = body.url;
+      if (!url || typeof url !== "string" || !/^https:\/\//.test(url)) {
+        return badRequest("A valid https:// webhook URL is required.");
+      }
       try {
         const result = await TelegramService.setWebhook(url);
         return ok({ success: true, webhookUrl: url, result });
