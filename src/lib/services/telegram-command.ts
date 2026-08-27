@@ -220,10 +220,12 @@ export const TelegramCommandService = {
       case "order_status": return this.setOrderStatus(ctx, params[0], params[1], messageId, lang);
       case "order_status_confirm": return this.confirmOrderStatus(ctx, params[0], params[1], messageId, lang);
       case "order_pay": return this.payOrderPrompt(ctx, params[0], messageId, lang);
+      case "order_pay_confirm": return this.confirmPayOrder(ctx, params[0], params[1], messageId, lang);
       case "customers_page": return this.paginateCustomers(ctx, Number(params[0]) || 1, messageId, lang);
       case "customer_view": return this.viewCustomer(ctx, params[0], messageId, lang);
       case "payments_page": return this.paginatePayments(ctx, Number(params[0]) || 1, messageId, lang);
       case "leads_page": return this.paginateLeads(ctx, Number(params[0]) || 1, messageId, lang);
+      case "lead_view": return this.viewLead(ctx, params[0], messageId, lang);
       case "lead_convert": return this.convertLead(ctx, params[0], messageId, lang);
       case "lead_convert_confirm": return this.confirmConvertLead(ctx, params[0], messageId, lang);
       case "inventory_page": return this.paginateInventory(ctx, Number(params[0]) || 1, messageId, lang);
@@ -397,6 +399,26 @@ export const TelegramCommandService = {
     await this.sendOrEdit(ctx, text, kb, messageId);
   },
 
+  // NOTE: was previously missing from handleCallbackData's switch — the
+  // "✅ Confirm" button on payOrderPrompt sent this callback_data but
+  // nothing handled it, so tapping it just showed "❓ Unknown action."
+  // and no payment was ever recorded. PaymentService was imported but
+  // never called.
+  async confirmPayOrder(ctx: CommandContext, orderId: string, amountStr: string, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "payments:create")) return this.deny(ctx, lang);
+    try {
+      const payment = await PaymentService.create({
+        orderId,
+        amount: amountStr,
+        method: "CASH",
+        notes: `Recorded via Telegram by ${ctx.user?.firstName ?? ctx.telegramUserId}`,
+      });
+      await this.sendOrEdit(ctx, `${this.t("done", lang)} Payment of <b>${money(toDecimal(payment.amount).toFixed(2))}</b> recorded.`, undefined, messageId);
+    } catch (e) {
+      await TelegramService.sendMessage(ctx.chatId, `❌ ${(e as Error).message}`);
+    }
+  },
+
   async cmdCustomers(ctx: CommandContext, _args: string[], lang: string) {
     if (!this.can(ctx, "customers:read")) return this.deny(ctx, lang);
     await this.paginateCustomers(ctx, 1, undefined, lang);
@@ -502,6 +524,22 @@ export const TelegramCommandService = {
       rows.push(...items.map((l) => [{ text: `🔄 Convert ${l.name.split(" ")[0]}`, callback_data: `lead_convert_confirm:${l.id}` }]));
     }
     rows.push(this.paginationRow(page, totalPages, "leads_page"));
+    await this.sendOrEdit(ctx, text, { inline_keyboard: rows }, messageId);
+  },
+
+  // NOTE: was previously missing from handleCallbackData's switch — tapping
+  // a lead row in /leads sent "lead_view:<id>" but nothing handled it, so
+  // every tap just showed "❓ Unknown action."
+  async viewLead(ctx: CommandContext, leadId: string, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "leads:read")) return this.deny(ctx, lang);
+    const lead = await db.metaLead.findUnique({ where: { id: leadId } });
+    if (!lead) return TelegramService.sendMessage(ctx.chatId, "Lead not found");
+    const text = `<b>🎯 ${lead.name}</b>\n📞 ${lead.phone ?? "—"}\n📣 Campaign: ${lead.campaign ?? "—"}\n📊 Status: ${lead.status}`;
+    const rows: any[][] = [];
+    if (this.can(ctx, "leads:update") && lead.status !== "CONVERTED") {
+      rows.push([{ text: "🔄 Convert to Customer", callback_data: `lead_convert_confirm:${lead.id}` }]);
+    }
+    rows.push([{ text: "⬅️ Back", callback_data: "leads_page:1" }]);
     await this.sendOrEdit(ctx, text, { inline_keyboard: rows }, messageId);
   },
 
