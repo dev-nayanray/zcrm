@@ -222,10 +222,17 @@ export const TwoFactorService = {
   },
 
   // Best-effort personal security alert to the account owner's Telegram DM.
+  // Respects the user's mute preference — but is only used for "FYI"
+  // notifications (login/logout/failed-attempt/lockout/2FA-toggle), never
+  // for the verification code or approve/deny buttons themselves, which
+  // always send via createLoginChallenge()/sendMessage directly.
   async notifySecurityEvent(userId: string, text: string) {
     try {
-      const linked = await this.getLinkedTelegramUser(userId);
-      if (!linked) return;
+      const [linked, user] = await Promise.all([
+        this.getLinkedTelegramUser(userId),
+        db.user.findUnique({ where: { id: userId }, select: { securityNotifyMuted: true } }),
+      ]);
+      if (!linked || user?.securityNotifyMuted) return;
       await TelegramService.sendMessage(linked.telegramId, text);
     } catch (e) {
       console.error("[TwoFactorService] notifySecurityEvent failed:", e);

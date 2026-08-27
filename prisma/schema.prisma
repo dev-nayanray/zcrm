@@ -38,6 +38,10 @@ model User {
 
   // Telegram-based two-factor authentication
   twoFactorEnabled     Boolean  @default(false)
+  // Personal "FYI" security DMs (login/logout/failed-attempt) can be
+  // muted independently of 2FA — the actual verification code/buttons
+  // always send regardless of this flag.
+  securityNotifyMuted  Boolean  @default(false)
 
   payments      Payment[]
   orders        Order[]

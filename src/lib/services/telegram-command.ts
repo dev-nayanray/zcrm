@@ -152,7 +152,7 @@ export const TelegramCommandService = {
           `• To use CRM commands (orders, inventory, leads, etc.), ask an admin to add this bot to your team's Telegram group.\n` +
           `• To enable two-step login verification for your account, go to CRM → Settings → Security → Connect Telegram, then send me the code shown there as:\n<code>/link YOUR_CODE</code>\n` +
           `• Once linked, I'll DM you here whenever your account logs in, logs out, or has a suspicious login attempt.\n` +
-          `• Send /security anytime to check your account's recent login activity.`,
+          `• Commands: /security (login history), /whoami (account info), /mute or /unmute (pause security DMs), /language en|bn.`,
       );
       return { ok: true, action: "private_start" };
     }
@@ -183,7 +183,7 @@ export const TelegramCommandService = {
       return { ok: true, action: "private_unlink" };
     }
 
-    if (command === "/security" || command === "/status") {
+    if (command === "/security" || command === "/status" || command === "/activity") {
       const linked = await db.telegramUser.findUnique({ where: { telegramId: fromId } });
       if (!linked?.crmUserId) {
         await TelegramService.sendMessage(chatId, "No linked CRM account found. Send <code>/link YOUR_CODE</code> to connect one first.");
@@ -194,26 +194,74 @@ export const TelegramCommandService = {
         await TelegramService.sendMessage(chatId, "That CRM account no longer exists.");
         return { ok: true, action: "private_security_missing" };
       }
+      const requested = Number(args[0]);
+      const take = Number.isFinite(requested) && requested > 0 ? Math.min(requested, 20) : 5;
       const recent = await db.auditLog.findMany({
         where: { userId: user.id, action: { in: ["LOGIN", "LOGOUT"] } },
         orderBy: { createdAt: "desc" },
-        take: 5,
+        take,
       });
       const lines = recent.length
-        ? recent.map((r) => `${r.action === "LOGIN" ? "🔓" : "🔒"} ${r.action} — ${r.ipAddress ?? "unknown IP"} · ${new Date(r.createdAt).toLocaleString()}`).join("\n")
+        ? recent.map((r) => `${r.action === "LOGIN" ? "🔓" : "🔒"} ${r.action} — ${r.ipAddress ?? "IP not recorded (older entry)"} · ${new Date(r.createdAt).toLocaleString()}`).join("\n")
         : "No recent activity.";
       await TelegramService.sendMessage(
         chatId,
         `🛡️ <b>Account security</b>\n\n` +
           `Account: <b>${user.name}</b> (${user.email})\n` +
-          `Two-step verification: <b>${user.twoFactorEnabled ? "Enabled ✅" : "Disabled ⚠️"}</b>\n\n` +
-          `<b>Recent activity:</b>\n${lines}\n\n` +
-          `${user.twoFactorEnabled ? "Send /unlink to disconnect Telegram (also disables 2FA)." : "Enable two-step verification from CRM → Settings → Security."}`,
+          `Two-step verification: <b>${user.twoFactorEnabled ? "Enabled ✅" : "Disabled ⚠️"}</b>\n` +
+          `Security DMs: <b>${user.securityNotifyMuted ? "Muted 🔕" : "On 🔔"}</b>\n\n` +
+          `<b>Recent activity (last ${recent.length}):</b>\n${lines}\n\n` +
+          `<i>Entries logged before this feature shipped won't show an IP — new logins always will.</i>\n\n` +
+          `Send /security 15 for more, /mute to pause these DMs, or /unmute to resume.`,
       );
       return { ok: true, action: "private_security" };
     }
 
-    await TelegramService.sendMessage(chatId, "❓ Send /start to see what I can do here, /link YOUR_CODE to connect your CRM account, or /security to check your account's login activity.");
+    if (command === "/mute" || command === "/unmute") {
+      const linked = await db.telegramUser.findUnique({ where: { telegramId: fromId } });
+      if (!linked?.crmUserId) {
+        await TelegramService.sendMessage(chatId, "No linked CRM account found. Send <code>/link YOUR_CODE</code> to connect one first.");
+        return { ok: true, action: "private_mute_unlinked" };
+      }
+      const muted = command === "/mute";
+      await db.user.update({ where: { id: linked.crmUserId }, data: { securityNotifyMuted: muted } });
+      await TelegramService.sendMessage(
+        chatId,
+        muted
+          ? "🔕 Muted. You won't get login/logout/failed-attempt DMs anymore. Verification codes for 2FA will still be sent — those can't be muted."
+          : "🔔 Unmuted. You'll get login/logout/failed-attempt DMs again.",
+      );
+      return { ok: true, action: command === "/mute" ? "private_mute" : "private_unmute" };
+    }
+
+    if (command === "/whoami") {
+      const linked = await db.telegramUser.findUnique({ where: { telegramId: fromId }, include: { crmUser: { include: { role: true } } } });
+      if (!linked?.crmUser) {
+        await TelegramService.sendMessage(chatId, `Telegram ID: <code>${fromId}</code>\nNo CRM account linked yet. Send <code>/link YOUR_CODE</code>.`);
+        return { ok: true, action: "private_whoami_unlinked" };
+      }
+      await TelegramService.sendMessage(
+        chatId,
+        `👤 <b>${linked.crmUser.name}</b>\n${linked.crmUser.email}\nRole: ${linked.crmUser.role.name}\nTelegram ID: <code>${fromId}</code>\nLanguage: ${linked.language ?? "en"}`,
+      );
+      return { ok: true, action: "private_whoami" };
+    }
+
+    if (command === "/language") {
+      const choice = args[0]?.toLowerCase();
+      if (choice !== "en" && choice !== "bn") {
+        await TelegramService.sendMessage(chatId, "Usage: <code>/language en</code> or <code>/language bn</code>");
+        return { ok: true, action: "private_language_usage" };
+      }
+      await TelegramService.upsertUser(fromId, { language: choice });
+      await TelegramService.sendMessage(chatId, choice === "bn" ? "✅ ভাষা বাংলা করা হয়েছে।" : "✅ Language set to English.");
+      return { ok: true, action: "private_language" };
+    }
+
+    await TelegramService.sendMessage(
+      chatId,
+      "❓ Send /start for an overview, /link YOUR_CODE to connect your account, /security to check login activity, /whoami for your account, /mute or /unmute to control security DMs, or /language en|bn.",
+    );
     return { ok: true, action: "private_unknown" };
   },
 
