@@ -61,8 +61,26 @@ export function LandingPage() {
     return () => window.removeEventListener("scroll", onScroll);
   }, []);
 
+  // Lock body scroll while the mobile menu is open, and let Escape close it.
+  useEffect(() => {
+    if (!mobileOpen) return;
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setMobileOpen(false);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.body.style.overflow = prevOverflow;
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [mobileOpen]);
+
   return (
     <div ref={containerRef} className="min-h-screen flex flex-col bg-background app-bg overflow-x-hidden">
+      {/* Skip link for keyboard & screen-reader users */}
+      <a href="#main-content" className="skip-link">Skip to main content</a>
+
       {/* Scroll progress bar */}
       <ScrollProgress />
 
@@ -96,12 +114,18 @@ export function LandingPage() {
               Get Started <ArrowRight className="h-3.5 w-3.5" />
             </Link>
           </div>
-          <button className="md:hidden p-2 -mr-2" onClick={() => setMobileOpen(!mobileOpen)} aria-label="Toggle menu">
+          <button
+            className="md:hidden p-2 -mr-2"
+            onClick={() => setMobileOpen(!mobileOpen)}
+            aria-label={mobileOpen ? "Close menu" : "Open menu"}
+            aria-expanded={mobileOpen}
+            aria-controls="mobile-nav-menu"
+          >
             {mobileOpen ? <X className="h-5 w-5" /> : <Menu className="h-5 w-5" />}
           </button>
         </div>
         {mobileOpen && (
-          <div className="md:hidden border-t border-border/20 bg-card px-4 py-4 space-y-3">
+          <div id="mobile-nav-menu" className="md:hidden border-t border-border/20 bg-card px-4 py-4 space-y-3">
             {NAV_LINKS.map((l) => (
               <Link key={l.href} href={l.href} className="block text-sm font-medium py-1" onClick={() => setMobileOpen(false)}>{l.label}</Link>
             ))}
@@ -115,6 +139,7 @@ export function LandingPage() {
 
       {/* ─── 1. HERO + DASHBOARD PREVIEW ─── */}
       <motion.section
+        id="main-content"
         style={{ y: heroY, opacity: heroOpacity }}
         className="relative pt-32 pb-16 px-4 md:px-6 overflow-hidden min-h-[92vh] flex flex-col justify-center"
       >
@@ -144,7 +169,7 @@ export function LandingPage() {
               transition={{ duration: 0.6, delay: 0.1 }}
               className="text-4xl md:text-6xl lg:text-7xl font-bold tracking-tight mb-5"
             >
-              Run your entire<br /><span className="gradient-text">business from one place.</span>
+              Run your entire<br className="hidden sm:inline" /> <span className="gradient-text">business from one place.</span>
             </motion.h1>
             <motion.p
               initial={{ opacity: 0, y: 24 }}
