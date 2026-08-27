@@ -14,7 +14,7 @@ Business Services (transaction-safe, owns the accounting & inventory logic)
    │  ReturnService, RefundService, AccountingService, AuditService,
    │  WooCommerceService, NotificationService
    ▼
-Prisma ORM → Database (SQLite sandbox / Supabase PostgreSQL production)
+Prisma ORM → Database (MongoDB Atlas)
    ▲
 CRM Dashboard — single-page app on `/` with a Zustand client-side router
 ```
@@ -24,7 +24,7 @@ CRM Dashboard — single-page app on `/` with a Zustand client-side router
 1. **UI never contains critical business logic.** Components render data; all accounting, inventory and money operations live in services.
 2. **Frontend-supplied financial values are never trusted.** Order totals, COGS, payment status are recomputed server-side from DB state.
 3. **Inventory has one authoritative source: the Stock Movement ledger.** `Inventory.quantity` is only ever changed inside a transaction that also writes a `StockMovement` row with `previousQuantity / quantityChange / newQuantity`.
-4. **Money uses Prisma `Decimal`** — no floating-point arithmetic anywhere.
+4. **Money uses `Prisma.Decimal` for arithmetic** — values are stored as Float (MongoDB limitation) but all calculations go through `decimal.ts` Decimal helpers. Migration to integer minor units planned.
 5. **Order items store historical snapshots** of `productName`, `sku`, `unitPrice`, `unitCost`. Changing a product's price later cannot alter historical order profitability.
 6. **All financial transactions use `db.$transaction`** with a 20s timeout. Audit logs are written inside the same transaction (passing `tx`) to avoid SQLite write-lock deadlocks.
 7. **RBAC is enforced on every endpoint** — hiding buttons in the UI is not security.
@@ -71,7 +71,7 @@ src/
     db.ts           # Prisma client singleton
     services/       # business logic (the single source of truth)
 prisma/
-  schema.prisma     # full schema (29 models)
+  schema.prisma     # full schema (68 models)
   seed.ts           # realistic Bangladesh business data
 docs/               # architecture, database, api, auth, rbac, inventory, accounting, woocommerce, deployment
 ```

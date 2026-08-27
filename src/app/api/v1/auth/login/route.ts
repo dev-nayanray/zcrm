@@ -1,6 +1,6 @@
 import { NextRequest } from "next/server";
 import { db } from "@/lib/db";
-import { verifyPassword, createSession, hashPassword, shouldRehash } from "@/lib/auth";
+import { verifyPassword, createSession, hashPassword, shouldRehash, recordFailedLogin, resetFailedLogins } from "@/lib/auth";
 import { loginSchema } from "@/lib/validation";
 import { ok, unauthorized, validationError, serverError, tooManyRequests } from "@/lib/api";
 import { readJsonBody, rateLimit, clientIp } from "@/lib/guards";
@@ -45,8 +45,20 @@ export async function POST(request: NextRequest) {
       return unauthorized("Invalid email or password");
     }
 
+    // Check if account is locked
+    if (user.lockedUntil && new Date() < user.lockedUntil) {
+      await verifyPassword(password, DECOY_HASH);
+      return unauthorized("Account is temporarily locked due to too many failed attempts. Try again later.");
+    }
+
     const valid = await verifyPassword(password, user.passwordHash);
-    if (!valid) return unauthorized("Invalid email or password");
+    if (!valid) {
+      await recordFailedLogin(email);
+      return unauthorized("Invalid email or password");
+    }
+
+    // Reset failed attempts on successful login
+    await resetFailedLogins(user.id);
 
     // Rehash the password if the stored hash uses an old iteration count.
     // Transparent to the user — they log in successfully and the stored

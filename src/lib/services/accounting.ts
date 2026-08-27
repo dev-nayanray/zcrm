@@ -29,12 +29,17 @@ import { toDecimal } from "@/lib/decimal";
 
 export type DateRange = { from?: Date; to?: Date };
 
-function rangeWhere(range?: DateRange) {
+function dateRangeCondition(range?: DateRange): { gte?: Date; lte?: Date } {
   if (!range || (!range.from && !range.to)) return {};
-  const cond: Record<string, Date> = {};
+  const cond: { gte?: Date; lte?: Date } = {};
   if (range.from) cond.gte = range.from;
   if (range.to) cond.lte = range.to;
-  return { createdAt: cond };
+  return cond;
+}
+
+function rangeWhere(range?: DateRange) {
+  const cond = dateRangeCondition(range);
+  return Object.keys(cond).length ? { createdAt: cond } : {};
 }
 
 export const AccountingService = {
@@ -77,7 +82,7 @@ export const AccountingService = {
 
     // Operating expenses in range
     const expenseAgg = await db.expense.aggregate({
-      where: { expenseDate: rangeWhere(range).createdAt ?? {} },
+      where: { expenseDate: dateRangeCondition(range) },
       _sum: { amount: true },
     });
     const operatingExpenses = toDecimal(expenseAgg._sum.amount ?? 0);

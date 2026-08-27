@@ -71,20 +71,20 @@ function constantTimeEqual(a: string, b: string) {
   return result === 0;
 }
 
-async function signToken(payload: { uid: string; ts: number }): Promise<string> {
+async function signToken(payload: { uid: string; ts: number; tv: number }): Promise<string> {
   const body = btoa(JSON.stringify(payload));
   const sig = await hmacSign(body);
   return `${body}.${sig}`;
 }
 
-async function verifyToken(token: string): Promise<{ uid: string; ts: number } | null> {
+async function verifyToken(token: string): Promise<{ uid: string; ts: number; tv: number } | null> {
   const parts = token.split(".");
   if (parts.length !== 2) return null;
   const [body, sig] = parts;
   const expected = await hmacSign(body);
   if (!constantTimeEqual(sig, expected)) return null;
   try {
-    const payload = JSON.parse(atob(body)) as { uid: string; ts: number };
+    const payload = JSON.parse(atob(body)) as { uid: string; ts: number; tv: number };
     const ageMs = Date.now() - payload.ts;
     const sevenDays = 7 * 24 * 60 * 60 * 1000;
     if (ageMs > sevenDays) return null;
@@ -155,8 +155,13 @@ export function shouldRehash(stored: string): boolean {
 
 // --- session management ---
 
+// Account lockout configuration
+const MAX_FAILED_ATTEMPTS = 5;
+const LOCKOUT_DURATION_MS = 15 * 60 * 1000; // 15 minutes
+
 export async function createSession(userId: string) {
-  const token = await signToken({ uid: userId, ts: Date.now() });
+  const user = await db.user.findUnique({ where: { id: userId } });
+  const token = await signToken({ uid: userId, ts: Date.now(), tv: user?.tokenVersion ?? 0 });
   const cookieStore = await cookies();
   cookieStore.set(SESSION_COOKIE, token, {
     httpOnly: true,
@@ -187,10 +192,42 @@ export async function getCurrentUser(): Promise<AuthUser | null> {
       include: { role: true },
     });
     if (!user || !user.isActive) return null;
+    // Verify token version matches (session revocation check)
+    if (payload.tv !== user.tokenVersion) return null;
+    // Check account lockout
+    if (user.lockedUntil && new Date() < user.lockedUntil) return null;
     return user;
   } catch {
     return null;
   }
+}
+
+// Increment token version to invalidate all sessions for a user
+export async function revokeAllSessions(userId: string): Promise<void> {
+  await db.user.update({
+    where: { id: userId },
+    data: { tokenVersion: { increment: 1 } },
+  });
+}
+
+// Record a failed login attempt; lock account if threshold exceeded
+export async function recordFailedLogin(email: string): Promise<void> {
+  const user = await db.user.findUnique({ where: { email } });
+  if (!user) return;
+  const attempts = user.failedLoginAttempts + 1;
+  const data: { failedLoginAttempts: number; lockedUntil?: Date } = { failedLoginAttempts: attempts };
+  if (attempts >= MAX_FAILED_ATTEMPTS) {
+    data.lockedUntil = new Date(Date.now() + LOCKOUT_DURATION_MS);
+  }
+  await db.user.update({ where: { id: user.id }, data });
+}
+
+// Reset failed login attempts on successful login
+export async function resetFailedLogins(userId: string): Promise<void> {
+  await db.user.update({
+    where: { id: userId },
+    data: { failedLoginAttempts: 0, lockedUntil: null },
+  });
 }
 
 // --- RBAC helpers ---

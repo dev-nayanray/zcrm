@@ -1,6 +1,6 @@
 # Database
 
-Prisma schema with 29 models. SQLite in the sandbox (Decimal stored as TEXT); identical schema works on PostgreSQL for production.
+Prisma schema with 68 models. MongoDB Atlas (production). All monetary fields stored as `Float` (MongoDB has no native Decimal type); arithmetic uses `Prisma.Decimal` via `src/lib/decimal.ts`.
 
 ## Auth, Users, Roles
 
@@ -8,7 +8,7 @@ Prisma schema with 29 models. SQLite in the sandbox (Decimal stored as TEXT); id
 |---|---|
 | `User` | email (unique), name, phone, `passwordHash` (PBKDF2), `roleId`, `isActive`, `lastLoginAt` |
 | `Role` | name (unique: SUPER_ADMIN/ADMIN/MANAGER/SALES/INVENTORY/ACCOUNTANT), `isSystem` |
-| `Permission` | action (unique, e.g. `orders:create`); M2M with `Role` |
+| `Permission` | action (unique, e.g. `orders:create`); permissions referenced via `Role.permissionActions` String[] |
 
 ## CRM
 
@@ -16,7 +16,7 @@ Prisma schema with 29 models. SQLite in the sandbox (Decimal stored as TEXT); id
 |---|---|
 | `Customer` | name, phone (**unique**), email, address, city, notes, `externalId` (Woo id). Has many `Order`, `Payment`, `Return` |
 | `Category` | name, slug (**unique**), `parentId` (self-relation "CategoryTree"), status, sortOrder, externalId. Circular parent prevented in service |
-| `Product` | sku (**unique**), slug (**unique**), categoryId, brand, `purchasePrice`/`sellingPrice`/`wholesalePrice`/`minimumStockLevel` (Decimal), status, externalId. Has one `Inventory` |
+| `Product` | sku (**unique**), slug (**unique**), categoryId, brand, `purchasePrice`/`sellingPrice`/`wholesalePrice`/`minimumStockLevel` (Float), status, externalId. Has one `Inventory` |
 | `Supplier` | name, phone, email, address, company, notes. Has many `Purchase` |
 | `Channel` | name (**unique**): Website, Facebook, Messenger, WhatsApp, Phone, Physical Store, Other |
 
@@ -24,7 +24,7 @@ Prisma schema with 29 models. SQLite in the sandbox (Decimal stored as TEXT); id
 
 | Model | Key fields |
 |---|---|
-| `Order` | `orderNumber` (**unique**), customerId, channelId, status, `paymentStatus`, `subtotal`/`discount`/`shippingCost`/`otherCost`/`total`/`paidAmount` (Decimal), `externalId`, `syncStatus`, `createdBy`. Has many `OrderItem`, `Payment`, `Return`, `Refund`, `OrderStatusHistory` |
+| `Order` | `orderNumber` (**unique**), customerId, channelId, status, `paymentStatus`, `subtotal`/`discount`/`shippingCost`/`otherCost`/`total`/`paidAmount` (Float), `externalId`, `syncStatus`, `createdBy`. Has many `OrderItem`, `Payment`, `Return`, `Refund`, `OrderStatusHistory` |
 | `OrderItem` | `productId`, **`productName`** (snapshot), **`sku`** (snapshot), `quantity`, **`unitPrice`** (snapshot), **`unitCost`** (snapshot = COGS), discount, total. Indexed by orderId & productId |
 | `OrderStatusHistory` | orderId, status, note, createdBy — append-only audit of status changes |
 
@@ -39,7 +39,7 @@ Prisma schema with 29 models. SQLite in the sandbox (Decimal stored as TEXT); id
 
 | Model | Key fields |
 |---|---|
-| `Purchase` | `purchaseNumber` (**unique**), supplierId, status (PENDING/RECEIVED/CANCELLED), subtotal/discount/shippingCost/total/paidAmount/dueAmount (Decimal), paymentStatus, createdBy |
+| `Purchase` | `purchaseNumber` (**unique**), supplierId, status (PENDING/RECEIVED/CANCELLED), subtotal/discount/shippingCost/total/paidAmount/dueAmount (Float), paymentStatus, createdBy |
 | `PurchaseItem` | productId, quantity, `unitCost`, total |
 | `ExpenseCategory` | name (**unique**): Delivery/Packaging/Marketing/Salary/Rent/Utility/Office/Transport/Other |
 | `Expense` | categoryId, amount, `paymentMethod`, description, reference, `expenseDate`, createdBy |
@@ -60,7 +60,7 @@ Prisma schema with 29 models. SQLite in the sandbox (Decimal stored as TEXT); id
 ## Concurrency & integrity
 
 - `db.$transaction` for: order create, payment create, purchase create/receive, returns, refunds, stock adjustments.
-- Stock movements happen **inside** the owning transaction (passed `tx`) — never a nested `db.$transaction` (which would deadlock on SQLite's single-writer lock).
+- Stock movements happen **inside** the owning transaction (passed `tx`) — never a nested `db.$transaction`.
 - Audit logs are written inside the same transaction (passed `tx`) so the audit trail commits atomically with the business change.
 - Negative stock prevented unless `Setting.allowNegativeStock = "true"`.
 - Unique constraints on sku, slug, orderNumber, purchaseNumber, phone, externalId pairs.

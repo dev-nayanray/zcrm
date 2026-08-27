@@ -2,10 +2,10 @@
 
 ## Your Atlas Cluster
 
-The Z-CRM backend is fully migrated to MongoDB and ready for MongoDB Atlas. Your connection string is configured in `.env`:
+The Z-CRM backend uses MongoDB Atlas. Configure your connection string in `.env`:
 
 ```
-MONGODB_URI=mongodb+srv://nayangodevs_db_user:YUBej3ctQttKEmqv@crm.3iumfww.mongodb.net/zcrm?retryWrites=true&w=majority&appName=crm
+MONGODB_URI=mongodb+srv://<username>:<password>@<cluster>.mongodb.net/zcrm?retryWrites=true&w=majority&appName=crm
 ```
 
 ## Sandbox Limitation (Development)
@@ -26,7 +26,7 @@ When deploying to a VPS, EC2, Docker container, or any environment with unrestri
 
 1. **Set the Atlas connection string** in `.env`:
    ```
-   MONGODB_URI=mongodb+srv://nayangodevs_db_user:YUBej3ctQttKEmqv@crm.3iumfww.mongodb.net/zcrm?retryWrites=true&w=majority&appName=crm
+   MONGODB_URI=mongodb+srv://<username>:<password>@<cluster>.mongodb.net/zcrm?retryWrites=true&w=majority&appName=crm
    ```
 
 2. **Whitelist your deployment IP** in Atlas:
@@ -50,15 +50,11 @@ When deploying to a VPS, EC2, Docker container, or any environment with unrestri
 
 ## Atlas Cluster Details
 
-- **Cluster name**: `crm`
-- **Cluster URL**: `crm.3iumfww.mongodb.net`
+- **Cluster name**: `<your-cluster-name>`
+- **Cluster URL**: `<your-cluster>.mongodb.net`
 - **Database name**: `zcrm`
-- **Username**: `nayangodevs_db_user`
-- **Replica set**: `atlas-4fukdd-shard-0`
-- **Shard hosts**:
-  - `ac-xxzs9ai-shard-00-00.3iumfww.mongodb.net:27017`
-  - `ac-xxzs9ai-shard-00-01.3iumfww.mongodb.net:27017`
-  - `ac-xxzs9ai-shard-00-02.3iumfww.mongodb.net:27017`
+- **Username**: `<your-db-username>`
+- **Replica set**: `<your-replica-set>`
 
 ## What was migrated
 

@@ -1,0 +1,9 @@
+#!/bin/sh
+. "$(dirname "$0")/_husky.sh"
+
+# Prevent committing secrets
+if git diff --cached --name-only | xargs grep -lE 'mongodb\+srv://|AUTH_SECRET=[a-f0-9]{32,}' 2>/dev/null; then
+  echo "ERROR: Potential secret detected in staged files."
+  echo "Remove credentials before committing."
+  exit 1
+fi

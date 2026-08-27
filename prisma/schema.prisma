@@ -29,6 +29,13 @@ model User {
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
 
+  // Account lockout after failed login attempts
+  failedLoginAttempts Int   @default(0)
+  lockedUntil         DateTime?
+
+  // Session revocation — increment to invalidate all existing sessions
+  tokenVersion        Int   @default(0)
+
   payments      Payment[]
   orders        Order[]
   purchases     Purchase[]

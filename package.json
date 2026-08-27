@@ -12,7 +12,8 @@
     "db:migrate": "prisma migrate dev",
     "db:reset": "prisma migrate reset",
     "seed": "tsx prisma/seed.ts",
-    "test": "bun test --timeout 30000 tests/"
+    "test": "bun test --timeout 30000 tests/",
+    "prepare": "husky"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",
@@ -90,6 +91,7 @@
     "cross-env": "^7.0.3",
     "eslint": "^9",
     "eslint-config-next": "^16.1.1",
+    "husky": "^9.1.7",
     "tailwindcss": "^4",
     "tsx": "^4.23.12",
     "tw-animate-css": "^1.3.5",

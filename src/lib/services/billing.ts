@@ -122,14 +122,17 @@ export const BillingService = {
       if (order.method === "WALLET") {
         const wallet = await tx.wallet.findUnique({ where: { userId: order.userId } });
         if (wallet) {
-          const newBalance = toDecimal(wallet.balance).minus(toDecimal(order.amount));
-          await tx.wallet.update({ where: { id: wallet.id }, data: { balance: newBalance, totalSpent: toDecimal(wallet.totalSpent).plus(toDecimal(order.amount)) } });
+          const balance = toDecimal(wallet.balance);
+          const amount = toDecimal(order.amount);
+          if (balance.lt(amount)) throw new Error("Insufficient wallet balance");
+          const newBalance = balance.minus(amount);
+          await tx.wallet.update({ where: { id: wallet.id }, data: { balance: newBalance, totalSpent: toDecimal(wallet.totalSpent).plus(amount) } });
           await tx.walletTransaction.create({
             data: {
               walletId: wallet.id,
               userId: order.userId,
               type: "PAYMENT",
-              amount: toDecimal(order.amount).negated(),
+              amount: amount.negated(),
               balanceAfter: newBalance,
               description: `Subscription payment — ${order.plan}`,
               relatedOrderId: order.id,

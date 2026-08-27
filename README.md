@@ -41,11 +41,11 @@ Replaces manual notebook/Excel bookkeeping for daily operations.
 | State | Zustand (client), TanStack Query patterns via `fetch` wrapper |
 | Charts | Recharts |
 | Forms | React Hook Form patterns + Zod validation |
-| Database | Prisma ORM (SQLite in sandbox; Supabase PostgreSQL in production target) |
-| Auth | Cookie-based HMAC-signed sessions (mirrors Supabase Auth contract) |
-| Accounting | Prisma `Decimal` (no floating-point money) |
+| Database | Prisma ORM (MongoDB Atlas) |
+| Auth | Cookie-based HMAC-signed sessions |
+| Accounting | `decimal.ts` helpers (Float storage with Decimal arithmetic) |
 
-> **Note on the sandbox:** this repository runs on SQLite (the sandbox only ships the SQLite Prisma client). The schema and all business logic are PostgreSQL-compatible — to deploy on Supabase, change the `datasource` provider to `postgresql` and run `prisma migrate deploy`. The auth layer is isolated in `src/lib/auth.ts` so you can swap the cookie-session implementation for Supabase Auth without touching the rest of the app.
+> **Note on money handling:** MongoDB has no native Decimal type, so monetary fields are stored as `Float`. All arithmetic is performed using `Prisma.Decimal` via `src/lib/decimal.ts` to avoid floating-point errors. A migration to integer minor units (e.g. 1/100 of a taka) is planned to eliminate Float round-trip drift.
 
 ---
 
@@ -136,9 +136,11 @@ See `docs/api.md` for the full list.
 ## Quality Gates
 
 ```bash
-bun run lint      # ESLint — PASS
-npx tsc --noEmit  # TypeScript strict — PASS
-bun run dev       # Verified end-to-end via headless browser
+npx prisma generate  # Generate Prisma client (required after schema changes)
+bun run lint         # ESLint
+npx tsc --noEmit     # TypeScript strict
+bun test             # Run tests
+npm run build        # Production build
 ```
 
 ---
@@ -152,5 +154,5 @@ bun run dev       # Verified end-to-end via headless browser
 - `docs/rbac.md` — roles & permissions matrix
 - `docs/inventory.md` — the stock movement ledger
 - `docs/accounting.md` — Revenue, COGS, P&L calculation
-- `docs/woocommerce.md` — sync & idempotent webhooks
-- `docs/deployment.md` — Vercel + Supabase + WooCommerce webhook setup
+- `docs/mongodb-atlas.md` — MongoDB Atlas setup & configuration
+- `docs/deployment.md` — Vercel deployment guide
