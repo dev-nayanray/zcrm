@@ -109,7 +109,10 @@ export const TwoFactorService = {
 
   // --- Login challenge ---
 
-  async createLoginChallenge(userId: string): Promise<{ ok: true; challengeToken: string } | { ok: false; message: string }> {
+  async createLoginChallenge(
+    userId: string,
+    meta?: { ipAddress?: string; userAgent?: string },
+  ): Promise<{ ok: true; challengeToken: string } | { ok: false; message: string }> {
     const linked = await this.getLinkedTelegramUser(userId);
     if (!linked) {
       return { ok: false, message: "Two-step verification is enabled but no Telegram account is linked. Contact an administrator." };
@@ -117,10 +120,21 @@ export const TwoFactorService = {
     const code = randomDigits(6);
     const codeHash = await sha256(code);
     const expiresAt = new Date(Date.now() + CHALLENGE_TTL_MS);
-    const challenge = await db.twoFactorChallenge.create({ data: { userId, codeHash, expiresAt } });
+    const challenge = await db.twoFactorChallenge.create({
+      data: { userId, codeHash, expiresAt, ipAddress: meta?.ipAddress, userAgent: meta?.userAgent },
+    });
+    const contextLine = meta?.ipAddress ? `\n📍 IP: <code>${meta.ipAddress}</code>${meta.userAgent ? `\n💻 ${escapeHtml(meta.userAgent.slice(0, 60))}` : ""}` : "";
     const sent = await TelegramService.sendMessage(
       linked.telegramId,
-      `🔐 <b>Z-CRM login verification code</b>\n\n<code>${code}</code>\n\nThis code expires in 5 minutes. If you didn't try to log in, ignore this message.`,
+      `🔐 <b>Z-CRM login verification</b>${contextLine}\n\nCode: <code>${code}</code>\n\nTap a button below, or type the code in the app. Expires in 5 minutes.\n\n<i>If this wasn't you, tap "Not me" — it will block this login attempt.</i>`,
+      {
+        inline_keyboard: [
+          [
+            { text: "✅ Approve", callback_data: `2fa_decide:${challenge.id}:APPROVED` },
+            { text: "🚫 Not me", callback_data: `2fa_decide:${challenge.id}:DENIED` },
+          ],
+        ],
+      },
     );
     if (sent && (sent as any).ok === false) {
       return { ok: false, message: "Could not deliver the verification code via Telegram. Make sure you've started a chat with the bot." };
@@ -132,17 +146,29 @@ export const TwoFactorService = {
     const existing = await db.twoFactorChallenge.findUnique({ where: { id: challengeToken } });
     if (!existing || existing.consumed) return { ok: false, message: "Verification session expired. Please log in again." };
     await db.twoFactorChallenge.update({ where: { id: challengeToken }, data: { consumed: true } });
-    return this.createLoginChallenge(existing.userId);
+    return this.createLoginChallenge(existing.userId, { ipAddress: existing.ipAddress ?? undefined, userAgent: existing.userAgent ?? undefined });
   },
 
   async verifyLoginChallenge(challengeToken: string, code: string): Promise<{ ok: true; userId: string } | { ok: false; message: string }> {
     const challenge = await db.twoFactorChallenge.findUnique({ where: { id: challengeToken } });
-    if (!challenge || challenge.consumed || challenge.expiresAt < new Date()) {
+    if (!challenge) {
+      return { ok: false, message: "Verification code expired. Please log in again." };
+    }
+    if (challenge.decision === "DENIED") {
+      return { ok: false, message: "This login was blocked from Telegram." };
+    }
+    if (challenge.consumed || challenge.expiresAt < new Date()) {
       return { ok: false, message: "Verification code expired. Please log in again." };
     }
     if (challenge.attempts >= MAX_ATTEMPTS) {
       await db.twoFactorChallenge.update({ where: { id: challenge.id }, data: { consumed: true } });
+      await this.notifyBruteForceAttempt(challenge.userId, challenge.ipAddress ?? undefined);
       return { ok: false, message: "Too many incorrect attempts. Please log in again." };
+    }
+    // A tap on "Approve" satisfies verification without needing the typed code.
+    if (challenge.decision === "APPROVED") {
+      await db.twoFactorChallenge.update({ where: { id: challenge.id }, data: { consumed: true } });
+      return { ok: true, userId: challenge.userId };
     }
     const hash = await sha256(code.trim());
     // constant-time-ish compare via hash equality (hash length fixed)
@@ -153,4 +179,70 @@ export const TwoFactorService = {
     await db.twoFactorChallenge.update({ where: { id: challenge.id }, data: { consumed: true } });
     return { ok: true, userId: challenge.userId };
   },
+
+  // Poll target for the client while it's waiting on a button tap instead
+  // of (or alongside) typed-code entry.
+  async pollChallenge(challengeToken: string): Promise<{ status: "PENDING" | "APPROVED" | "DENIED" | "EXPIRED" }> {
+    const challenge = await db.twoFactorChallenge.findUnique({ where: { id: challengeToken } });
+    if (!challenge) return { status: "EXPIRED" };
+    if (challenge.decision === "APPROVED") return { status: "APPROVED" };
+    if (challenge.decision === "DENIED") return { status: "DENIED" };
+    if (challenge.consumed || challenge.expiresAt < new Date()) return { status: "EXPIRED" };
+    return { status: "PENDING" };
+  },
+
+  // Called from the Telegram callback handler when the user taps
+  // Approve/Deny on the login-verification DM.
+  async decideChallenge(challengeId: string, telegramId: string, decision: "APPROVED" | "DENIED"): Promise<{ ok: boolean; message: string }> {
+    const challenge = await db.twoFactorChallenge.findUnique({ where: { id: challengeId } });
+    if (!challenge) return { ok: false, message: "This verification request no longer exists." };
+    const linked = await this.getLinkedTelegramUser(challenge.userId);
+    if (!linked || linked.telegramId !== telegramId) {
+      return { ok: false, message: "This verification request doesn't belong to your account." };
+    }
+    if (challenge.consumed || challenge.expiresAt < new Date()) {
+      return { ok: false, message: "This verification request has expired." };
+    }
+    if (challenge.decision) {
+      return { ok: false, message: `Already marked as ${challenge.decision.toLowerCase()}.` };
+    }
+    await db.twoFactorChallenge.update({
+      where: { id: challengeId },
+      data: { decision, decidedAt: new Date() },
+    });
+    if (decision === "DENIED") {
+      await this.notifyBruteForceAttempt(challenge.userId, challenge.ipAddress ?? undefined, true);
+    }
+    return {
+      ok: true,
+      message: decision === "APPROVED"
+        ? "✅ Login approved. You can return to the app — it will continue automatically."
+        : "🚫 Login blocked. That sign-in attempt has been stopped.",
+    };
+  },
+
+  // Best-effort personal security alert to the account owner's Telegram DM.
+  async notifySecurityEvent(userId: string, text: string) {
+    try {
+      const linked = await this.getLinkedTelegramUser(userId);
+      if (!linked) return;
+      await TelegramService.sendMessage(linked.telegramId, text);
+    } catch (e) {
+      console.error("[TwoFactorService] notifySecurityEvent failed:", e);
+    }
+  },
+
+  async notifyBruteForceAttempt(userId: string, ipAddress?: string, wasExplicitDeny = false) {
+    const suffix = ipAddress ? `\n📍 IP: <code>${ipAddress}</code>` : "";
+    await this.notifySecurityEvent(
+      userId,
+      wasExplicitDeny
+        ? `🚫 <b>Login attempt blocked</b>\nYou marked a login attempt as "Not me."${suffix}\n\nIf you don't recognize this, consider changing your password.`
+        : `🚨 <b>Suspicious activity</b>\nToo many incorrect verification codes were entered for your account.${suffix}\n\nIf this wasn't you, consider changing your password.`,
+    );
+  },
 };
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}

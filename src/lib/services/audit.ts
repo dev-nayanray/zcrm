@@ -4,25 +4,35 @@ import { getCurrentUser } from "@/lib/auth";
 
 type TxClient = Prisma.TransactionClient | PrismaClient;
 
-// Actions that should NOT be broadcast to Telegram as a generic "CRM
-// updated" notification — auth/session noise and anything that could leak
-// sensitive config (bot tokens, secrets).
+// Actions that should NEVER be broadcast to any Telegram group — only
+// things that could leak sensitive config (bot tokens, webhook secrets).
+// Auth/session events are NOT excluded anymore: they're routed to their
+// own dedicated event types below instead of the generic CRM_UPDATE feed,
+// so admins can subscribe a "Security" group to real login/logout/2FA
+// activity without spamming the general updates channel with it.
 const BROADCAST_EXCLUDED_ACTIONS = new Set([
-  "LOGIN", "LOGOUT", "LOGIN_2FA_CHALLENGE",
-  "2FA_ENABLED", "2FA_DISABLED",
   "TELEGRAM_CONFIG",
 ]);
+
+// Auth/session actions get their own event type instead of "CRM_UPDATE".
+const AUTH_EVENT_TYPES: Record<string, string> = {
+  LOGIN: "LOGIN_ALERT",
+  LOGOUT: "LOGOUT_ALERT",
+  LOGIN_2FA_CHALLENGE: "SECURITY_ALERT",
+  "2FA_ENABLED": "SECURITY_ALERT",
+  "2FA_DISABLED": "SECURITY_ALERT",
+};
 
 function humanizeAction(action: string): string {
   return action.replace(/_/g, " ").toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
-// Best-effort broadcast of a generic CRM change to any Telegram group
-// subscribed to the "CRM_UPDATE" event. Fire-and-forget: never throws, and
-// is only invoked AFTER the audit row is durably written outside of any
-// in-flight transaction (see log() below) so we never notify about a
-// change that could still be rolled back.
-async function broadcastCrmUpdate(opts: { userId?: string | null; action: string; entity: string; entityId?: string | null }) {
+// Best-effort broadcast of a CRM change (or auth/security event) to any
+// Telegram group subscribed to the relevant event type. Fire-and-forget:
+// never throws, and is only invoked AFTER the audit row is durably written
+// outside of any in-flight transaction (see log() below) so we never
+// notify about a change that could still be rolled back.
+async function broadcastCrmUpdate(opts: { userId?: string | null; action: string; entity: string; entityId?: string | null; ipAddress?: string | null }) {
   if (BROADCAST_EXCLUDED_ACTIONS.has(opts.action)) return;
   try {
     const { TelegramService } = await import("./telegram");
@@ -31,8 +41,12 @@ async function broadcastCrmUpdate(opts: { userId?: string | null; action: string
       const user = await db.user.findUnique({ where: { id: opts.userId }, select: { name: true } }).catch(() => null);
       if (user) who = ` by ${user.name}`;
     }
-    const message = `🔄 <b>CRM Update</b>\n${humanizeAction(opts.action)} — ${opts.entity}${opts.entityId ? ` (${opts.entityId})` : ""}${who}`;
-    await TelegramService.routeNotification("CRM_UPDATE", message);
+    const eventType = AUTH_EVENT_TYPES[opts.action] ?? "CRM_UPDATE";
+    const ipLine = opts.ipAddress ? `\n📍 IP: <code>${opts.ipAddress}</code>` : "";
+    const message = eventType === "CRM_UPDATE"
+      ? `🔄 <b>CRM Update</b>\n${humanizeAction(opts.action)} — ${opts.entity}${opts.entityId ? ` (${opts.entityId})` : ""}${who}`
+      : `${eventType === "LOGIN_ALERT" ? "🔓" : eventType === "LOGOUT_ALERT" ? "🔒" : "🛡️"} <b>${humanizeAction(opts.action)}</b>${who ? `\n${who.trim()}` : ""}${ipLine}`;
+    await TelegramService.routeNotification(eventType, message);
   } catch (e) {
     console.error("[AuditService] broadcastCrmUpdate failed:", e);
   }
@@ -71,7 +85,7 @@ export const AuditService = {
       // own precise Telegram notifications (order, payment, inventory,
       // lead) for transactional flows — see routeNotification() call sites.
       if (!tx) {
-        void broadcastCrmUpdate(opts);
+        void broadcastCrmUpdate({ userId: opts.userId, action: opts.action, entity: opts.entity, entityId: opts.entityId, ipAddress: opts.ipAddress });
       }
     } catch (e) {
       // Audit logging must never break the main operation when called

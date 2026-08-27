@@ -54,7 +54,13 @@ export async function POST(request: NextRequest) {
 
     const valid = await verifyPassword(password, user.passwordHash);
     if (!valid) {
-      await recordFailedLogin(email);
+      const { justLocked } = await recordFailedLogin(email);
+      void TwoFactorService.notifySecurityEvent(
+        user.id,
+        justLocked
+          ? `🚨 <b>Account temporarily locked</b>\nToo many failed login attempts on your Z-CRM account. It's locked for a short cooldown period.\n📍 Last attempt IP: <code>${ip}</code>\n\nIf this wasn't you, consider changing your password.`
+          : `⚠️ <b>Failed login attempt</b>\nSomeone entered the wrong password for your Z-CRM account.\n📍 IP: <code>${ip}</code>\n\nIf this wasn't you, consider changing your password.`,
+      );
       return unauthorized("Invalid email or password");
     }
 
@@ -78,16 +84,23 @@ export async function POST(request: NextRequest) {
     // session yet. Send a one-time code to the user's linked Telegram DM
     // and hand back a challengeToken the client must verify first.
     if (user.twoFactorEnabled) {
-      const challenge = await TwoFactorService.createLoginChallenge(user.id);
+      const challenge = await TwoFactorService.createLoginChallenge(user.id, {
+        ipAddress: ip,
+        userAgent: request.headers.get("user-agent") ?? undefined,
+      });
       if (!challenge.ok) {
         return unauthorized(challenge.message);
       }
-      await AuditService.log({ userId: user.id, action: "LOGIN_2FA_CHALLENGE", entity: "User", entityId: user.id });
+      await AuditService.log({ userId: user.id, action: "LOGIN_2FA_CHALLENGE", entity: "User", entityId: user.id, ipAddress: ip });
       return ok({ twoFactorRequired: true, challengeToken: challenge.challengeToken });
     }
 
     await createSession(user.id);
-    await AuditService.log({ userId: user.id, action: "LOGIN", entity: "User", entityId: user.id });
+    await AuditService.log({ userId: user.id, action: "LOGIN", entity: "User", entityId: user.id, ipAddress: ip });
+    void TwoFactorService.notifySecurityEvent(
+      user.id,
+      `✅ <b>New login to your Z-CRM account</b>\n📍 IP: <code>${ip}</code>\n\nIf this wasn't you, secure your account immediately and contact an administrator.`,
+    );
 
     return ok({
       user: {

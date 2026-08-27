@@ -1247,13 +1247,24 @@ model TelegramLinkCode {
 // Telegram private chat. codeHash is SHA-256(code); the plaintext code is
 // never persisted.
 model TwoFactorChallenge {
-  id        String   @id @default(cuid()) @map("_id")
-  userId    String
-  codeHash  String
-  expiresAt DateTime
-  attempts  Int      @default(0)
-  consumed  Boolean  @default(false)
-  createdAt DateTime @default(now())
+  id         String   @id @default(cuid()) @map("_id")
+  userId     String
+  codeHash   String
+  expiresAt  DateTime
+  attempts   Int      @default(0)
+  consumed   Boolean  @default(false)
+  createdAt  DateTime @default(now())
+
+  // Context captured at challenge-creation time, shown in the Telegram DM
+  // so the user can spot a login attempt that isn't theirs.
+  ipAddress  String?
+  userAgent  String?
+
+  // Tap-to-approve/deny support: lets the user resolve the challenge from
+  // the inline Telegram buttons instead of typing the 6-digit code.
+  // null = still pending a decision via the buttons (code entry still works).
+  decision   String?  // "APPROVED" | "DENIED"
+  decidedAt  DateTime?
 
   @@index([userId])
 }

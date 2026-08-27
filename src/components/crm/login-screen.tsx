@@ -1,5 +1,5 @@
 "use client";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "@/lib/api-client";
 import { useCrmStore } from "@/lib/store";
 import { Button } from "@/components/ui/button";
@@ -28,12 +28,57 @@ export function LoginScreen() {
   const [otp, setOtp] = useState("");
   const [verifying, setVerifying] = useState(false);
   const [resending, setResending] = useState(false);
+  const [awaitingTap, setAwaitingTap] = useState(false);
+  const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
 
   async function afterLoginSuccess(res: { user: { id: string; name: string; email: string; role: { id: string; name: string } } }) {
     const me = await api.get<{ permissions: string[] }>("/api/v1/auth/me");
     setUser({ id: res.user.id, name: res.user.name, email: res.user.email, role: res.user.role.name, permissions: me.permissions });
     toast.success(`Welcome back, ${res.user.name}!`);
   }
+
+  function stopPolling() {
+    if (pollTimer.current) {
+      clearInterval(pollTimer.current);
+      pollTimer.current = null;
+    }
+    setAwaitingTap(false);
+  }
+
+  // While a 2FA challenge is pending, poll for a tap on the Telegram
+  // "Approve"/"Not me" buttons — an alternative to typing the code.
+  useEffect(() => {
+    if (!challengeToken) return;
+    setAwaitingTap(true);
+    pollTimer.current = setInterval(async () => {
+      try {
+        const res = await api.post<{ status: "PENDING" | "APPROVED" | "DENIED" | "EXPIRED" }>("/api/v1/auth/2fa/poll", { challengeToken });
+        if (res.status === "APPROVED") {
+          stopPolling();
+          setVerifying(true);
+          try {
+            const loginRes = await api.post<any>("/api/v1/auth/2fa/verify", { challengeToken });
+            await afterLoginSuccess(loginRes);
+          } catch (err) {
+            toast.error((err as Error).message || "Could not complete sign-in");
+          } finally {
+            setVerifying(false);
+          }
+        } else if (res.status === "DENIED") {
+          stopPolling();
+          toast.error("Login was blocked from Telegram.");
+          setChallengeToken(null);
+          setOtp("");
+        } else if (res.status === "EXPIRED") {
+          stopPolling();
+        }
+      } catch {
+        // transient poll failure — keep trying until the timer is cleared
+      }
+    }, 2500);
+    return () => stopPolling();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [challengeToken]);
 
   async function submit(e?: React.FormEvent) {
     e?.preventDefault();
@@ -132,7 +177,9 @@ export function LoginScreen() {
               <form onSubmit={verifyOtp} className="space-y-4">
                 <div className="rounded-lg border border-primary/30 bg-primary/5 p-3 text-sm text-muted-foreground flex items-center gap-2">
                   <Send className="h-4 w-4 text-primary shrink-0" />
-                  We sent a 6-digit verification code to your linked Telegram account.
+                  {awaitingTap
+                    ? "Tap Approve on the Telegram message, or type the 6-digit code below."
+                    : "We sent a verification code to your linked Telegram account."}
                 </div>
                 <div className="space-y-2">
                   <Label htmlFor="otp">Verification code</Label>

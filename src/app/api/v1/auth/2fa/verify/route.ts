@@ -14,16 +14,20 @@ export async function POST(request: NextRequest) {
     if (!rl.ok) return tooManyRequests(`Too many attempts. Try again in ${rl.retryAfterSec}s.`);
 
     const body = await readJsonBody<{ challengeToken?: string; code?: string }>(request);
-    if (!body?.challengeToken || !body?.code) return badRequest("challengeToken and code are required");
+    if (!body?.challengeToken) return badRequest("challengeToken is required");
 
-    const result = await TwoFactorService.verifyLoginChallenge(body.challengeToken, body.code);
+    const result = await TwoFactorService.verifyLoginChallenge(body.challengeToken, body.code ?? "");
     if (!result.ok) return unauthorized(result.message);
 
     const user = await db.user.findUnique({ where: { id: result.userId }, include: { role: true } });
     if (!user || !user.isActive) return unauthorized("Invalid account");
 
     await createSession(user.id);
-    await AuditService.log({ userId: user.id, action: "LOGIN", entity: "User", entityId: user.id });
+    await AuditService.log({ userId: user.id, action: "LOGIN", entity: "User", entityId: user.id, ipAddress: clientIp(request) });
+    void TwoFactorService.notifySecurityEvent(
+      user.id,
+      `✅ <b>Login verified</b>\nTwo-step verification completed and you're now signed in to Z-CRM.\n📍 IP: <code>${clientIp(request)}</code>`,
+    );
 
     return ok({
       user: {

@@ -9,6 +9,7 @@ export async function POST() {
     if (err) return err;
     await TwoFactorService.setEnabled(user!.id, true);
     await AuditService.log({ userId: user!.id, action: "2FA_ENABLED", entity: "User", entityId: user!.id });
+    void TwoFactorService.notifySecurityEvent(user!.id, "🛡️ <b>Two-step verification enabled</b>\nYour Z-CRM account now requires a Telegram code (or tap-to-approve) at every login.");
     return ok({ enabled: true });
   } catch (e) {
     return badRequest((e as Error).message);

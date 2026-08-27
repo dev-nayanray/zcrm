@@ -150,7 +150,9 @@ export const TelegramCommandService = {
         chatId,
         `👋 <b>Welcome to Z-CRM Bot!</b>\n\n` +
           `• To use CRM commands (orders, inventory, leads, etc.), ask an admin to add this bot to your team's Telegram group.\n` +
-          `• To enable two-step login verification for your account, go to CRM → Settings → Security → Connect Telegram, then send me the code shown there as:\n<code>/link YOUR_CODE</code>`,
+          `• To enable two-step login verification for your account, go to CRM → Settings → Security → Connect Telegram, then send me the code shown there as:\n<code>/link YOUR_CODE</code>\n` +
+          `• Once linked, I'll DM you here whenever your account logs in, logs out, or has a suspicious login attempt.\n` +
+          `• Send /security anytime to check your account's recent login activity.`,
       );
       return { ok: true, action: "private_start" };
     }
@@ -181,7 +183,37 @@ export const TelegramCommandService = {
       return { ok: true, action: "private_unlink" };
     }
 
-    await TelegramService.sendMessage(chatId, "❓ Send /start to see what I can do here, or /link YOUR_CODE to connect your CRM account.");
+    if (command === "/security" || command === "/status") {
+      const linked = await db.telegramUser.findUnique({ where: { telegramId: fromId } });
+      if (!linked?.crmUserId) {
+        await TelegramService.sendMessage(chatId, "No linked CRM account found. Send <code>/link YOUR_CODE</code> to connect one first.");
+        return { ok: true, action: "private_security_unlinked" };
+      }
+      const user = await db.user.findUnique({ where: { id: linked.crmUserId } });
+      if (!user) {
+        await TelegramService.sendMessage(chatId, "That CRM account no longer exists.");
+        return { ok: true, action: "private_security_missing" };
+      }
+      const recent = await db.auditLog.findMany({
+        where: { userId: user.id, action: { in: ["LOGIN", "LOGOUT"] } },
+        orderBy: { createdAt: "desc" },
+        take: 5,
+      });
+      const lines = recent.length
+        ? recent.map((r) => `${r.action === "LOGIN" ? "🔓" : "🔒"} ${r.action} — ${r.ipAddress ?? "unknown IP"} · ${new Date(r.createdAt).toLocaleString()}`).join("\n")
+        : "No recent activity.";
+      await TelegramService.sendMessage(
+        chatId,
+        `🛡️ <b>Account security</b>\n\n` +
+          `Account: <b>${user.name}</b> (${user.email})\n` +
+          `Two-step verification: <b>${user.twoFactorEnabled ? "Enabled ✅" : "Disabled ⚠️"}</b>\n\n` +
+          `<b>Recent activity:</b>\n${lines}\n\n` +
+          `${user.twoFactorEnabled ? "Send /unlink to disconnect Telegram (also disables 2FA)." : "Enable two-step verification from CRM → Settings → Security."}`,
+      );
+      return { ok: true, action: "private_security" };
+    }
+
+    await TelegramService.sendMessage(chatId, "❓ Send /start to see what I can do here, /link YOUR_CODE to connect your CRM account, or /security to check your account's login activity.");
     return { ok: true, action: "private_unknown" };
   },
 
@@ -192,6 +224,22 @@ export const TelegramCommandService = {
     const messageId = cb.message?.message_id;
 
     await TelegramService.answerCallbackQuery(cb.id);
+
+    // 2FA tap-to-approve/deny lives in the user's private chat with the
+    // bot, NOT a TelegramGroup — it must NOT go through resolveContext()
+    // (which requires group membership). Handled first, independently.
+    if (data.startsWith("2fa_decide:")) {
+      const [, challengeId, decision] = data.split(":");
+      const { TwoFactorService } = await import("./two-factor");
+      const result = await TwoFactorService.decideChallenge(challengeId, fromId, decision as "APPROVED" | "DENIED");
+      await TelegramService.sendMessage(chatId, result.message);
+      if (messageId) {
+        // Remove the buttons once a decision has been made so it can't be tapped twice.
+        await TelegramService.editMessage(chatId, messageId, `${result.ok ? "✅" : "❌"} ${result.message}`, { inline_keyboard: [] });
+      }
+      return { ok: result.ok, action: "2fa_decide" };
+    }
+
     const ctx = await this.resolveContext(fromId, chatId);
     if (!ctx) {
       await TelegramService.sendMessage(chatId, this.t("unauthorized", "en"));

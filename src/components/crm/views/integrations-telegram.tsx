@@ -14,7 +14,7 @@ import { toast } from "sonner";
 import { formatDate } from "@/lib/date-range";
 import { ROLES } from "@/lib/constants";
 
-const EVENT_TYPES = ["CRM_UPDATE", "NEW_ORDER", "NEW_LEAD", "NEW_MESSAGE", "LOW_STOCK", "OUT_OF_STOCK", "PAYMENT_RECEIVED", "DUE_PAYMENT", "DELIVERY_UPDATE", "STOCK_COUNT_APPROVAL", "SYSTEM_ALERT", "PURCHASE_DUE"];
+const EVENT_TYPES = ["CRM_UPDATE", "NEW_ORDER", "NEW_LEAD", "NEW_MESSAGE", "LOW_STOCK", "OUT_OF_STOCK", "PAYMENT_RECEIVED", "DUE_PAYMENT", "DELIVERY_UPDATE", "STOCK_COUNT_APPROVAL", "SYSTEM_ALERT", "PURCHASE_DUE", "LOGIN_ALERT", "LOGOUT_ALERT", "SECURITY_ALERT"];
 
 const EVENT_LABELS: Record<string, string> = {
   CRM_UPDATE: "🔄 Every CRM Update (all creates/edits/deletes)",
@@ -22,6 +22,7 @@ const EVENT_LABELS: Record<string, string> = {
   LOW_STOCK: "⚠️ Low Stock", OUT_OF_STOCK: "🚨 Out of Stock", PAYMENT_RECEIVED: "💰 Payment Received",
   DUE_PAYMENT: "📋 Due Payment", DELIVERY_UPDATE: "🚚 Delivery Update",
   STOCK_COUNT_APPROVAL: "📋 Stock Count Approval", SYSTEM_ALERT: "🔔 System Alert", PURCHASE_DUE: "🛒 Purchase Due",
+  LOGIN_ALERT: "🔓 User Login", LOGOUT_ALERT: "🔒 User Logout", SECURITY_ALERT: "🛡️ Security Alert (2FA, lockouts, brute force)",
 };
 
 export function TelegramIntegrationView() {

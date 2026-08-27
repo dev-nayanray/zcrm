@@ -211,15 +211,17 @@ export async function revokeAllSessions(userId: string): Promise<void> {
 }
 
 // Record a failed login attempt; lock account if threshold exceeded
-export async function recordFailedLogin(email: string): Promise<void> {
+export async function recordFailedLogin(email: string): Promise<{ justLocked: boolean }> {
   const user = await db.user.findUnique({ where: { email } });
-  if (!user) return;
+  if (!user) return { justLocked: false };
   const attempts = user.failedLoginAttempts + 1;
   const data: { failedLoginAttempts: number; lockedUntil?: Date } = { failedLoginAttempts: attempts };
-  if (attempts >= MAX_FAILED_ATTEMPTS) {
+  const justLocked = attempts >= MAX_FAILED_ATTEMPTS;
+  if (justLocked) {
     data.lockedUntil = new Date(Date.now() + LOCKOUT_DURATION_MS);
   }
   await db.user.update({ where: { id: user.id }, data });
+  return { justLocked };
 }
 
 // Reset failed login attempts on successful login
