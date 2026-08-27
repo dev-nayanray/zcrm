@@ -15,6 +15,15 @@ export async function POST(request: NextRequest) {
     if (!url || !/^https:\/\//.test(url)) {
       return badRequest("A valid https:// webhook URL is required.");
     }
+    // Same fix as /config: persist a supplied secret before registering it
+    // with Telegram, so the DB and Telegram's secret_token can never drift
+    // apart (a mismatch here silently drops every incoming update).
+    if (typeof body?.secret === "string" && body.secret) {
+      if (!/^[A-Za-z0-9_-]{1,256}$/.test(body.secret)) {
+        return badRequest("Webhook Secret can only contain letters, numbers, underscores (_) and hyphens (-), 1-256 characters.");
+      }
+      await TelegramService.saveConfig({ webhookSecret: body.secret });
+    }
     try {
       const result = await TelegramService.setWebhook(url);
       return ok({ success: true, webhookUrl: url, result });

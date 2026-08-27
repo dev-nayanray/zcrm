@@ -40,7 +40,16 @@ export function TelegramIntegrationView() {
     setWebhookResult(null);
     try {
       const url = form.webhookUrl || `${typeof window !== "undefined" ? window.location.origin : ""}/api/v1/integrations/telegram/webhook`;
-      const res = await api.post<any>("/api/v1/integrations/telegram/config", { action: "setWebhook", url });
+      // BUGFIX: previously didn't send the secret here at all, so a
+      // freshly-generated one sat in the form and never reached Telegram
+      // (or the DB) unless "Save Configuration" was clicked first, in the
+      // right order. Sending it here makes DB + Telegram always match,
+      // regardless of whether Save Config was clicked.
+      const res = await api.post<any>("/api/v1/integrations/telegram/config", {
+        action: "setWebhook",
+        url,
+        ...(form.webhookSecret ? { secret: form.webhookSecret } : {}),
+      });
       setWebhookResult({ ok: true });
       toast.success("Webhook set on Telegram! Your bot will now receive updates.");
       loadStatus();

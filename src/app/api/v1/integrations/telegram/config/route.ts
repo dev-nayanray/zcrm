@@ -40,7 +40,7 @@ export async function POST(request: NextRequest) {
   try {
     const [user, err] = await requirePermission("telegram:update");
     if (err) return err;
-    const body = await readJsonBody<{ action?: string; url?: string }>(request);
+    const body = await readJsonBody<{ action?: string; url?: string; secret?: string }>(request);
 
     if (body?.action === "setWebhook" || body?.url) {
       // NOTE: previously fell back to a hardcoded dev-preview domain
@@ -52,6 +52,24 @@ export async function POST(request: NextRequest) {
       const url = body.url;
       if (!url || typeof url !== "string" || !/^https:\/\//.test(url)) {
         return badRequest("A valid https:// webhook URL is required.");
+      }
+      // BUGFIX: this endpoint used to call TelegramService.setWebhook(url),
+      // which registers Telegram's secret_token from whatever webhookSecret
+      // is CURRENTLY IN THE DB. The frontend's "Generate" button only fills
+      // a local form field — it never reached the DB unless the admin
+      // separately clicked "Save Configuration" *first*. Any admin who
+      // generated a secret and went straight to "Set Webhook" (the natural
+      // reading of the two buttons) ended up with Telegram registered
+      // against a secret that didn't match the DB (or no secret at all),
+      // so every single incoming update — /start, group commands, 2FA
+      // codes, everything — failed the secret check and was silently
+      // dropped. Now: if the caller supplies `secret`, persist it FIRST so
+      // the DB and Telegram are always set atomically from the same value.
+      if (body.secret !== undefined) {
+        if (body.secret && !/^[A-Za-z0-9_-]{1,256}$/.test(body.secret)) {
+          return badRequest("Webhook Secret can only contain letters, numbers, underscores (_) and hyphens (-), 1-256 characters.");
+        }
+        await TelegramService.saveConfig({ webhookSecret: body.secret });
       }
       try {
         const result = await TelegramService.setWebhook(url);
