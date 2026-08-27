@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from "recharts";
 import { ArrowDownRight, ArrowUpRight, DollarSign, ShoppingCart, Wallet, TrendingDown, Package, AlertTriangle, PackageX } from "lucide-react";
-import { PageHeader, StatusBadge, StatCard } from "../ui";
+import { PageHeader, StatusBadge, StatCard, CardSkeleton } from "../ui";
 import { resolveRange } from "@/lib/date-range";
 
 type DashboardData = {
@@ -67,6 +67,25 @@ export function DashboardView() {
   ];
 
   const profitColor = (n: number) => (n >= 0 ? "text-emerald-600" : "text-red-600");
+
+  // Initial load — show skeletons instead of a flash of "৳0.00" everywhere,
+  // which can misread as "you have no sales" for a split second.
+  if (loading && !data && !error) {
+    return (
+      <div className="space-y-6">
+        <PageHeader
+          title={`Welcome back, ${user?.name?.split(" ")[0] ?? "User"}`}
+          description="Business overview with the same accounting engine used by all reports."
+        />
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+          {Array.from({ length: 4 }).map((_, i) => <CardSkeleton key={i} lines={2} />)}
+        </div>
+        <div className="grid lg:grid-cols-2 gap-4">
+          {Array.from({ length: 2 }).map((_, i) => <CardSkeleton key={i} lines={5} />)}
+        </div>
+      </div>
+    );
+  }
 
   // Error state — show a retry UI instead of misleading "৳0.00" everywhere.
   if (error && !data) {

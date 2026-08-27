@@ -1,7 +1,7 @@
 "use client";
 import { useCrmStore, type RouteKey } from "@/lib/store";
 import { cn } from "@/lib/utils";
-import { useState } from "react";
+import { useEffect } from "react";
 import {
   LayoutDashboard, ShoppingCart, Users, Package, FolderTree, Warehouse, Truck, Phone,
   Wallet, Receipt, TrendingUp, BarChart3, ShieldCheck, Plug, ScrollText, Settings, Bell, Boxes,
@@ -115,6 +115,7 @@ function NavListInner({ onNavigate }: { onNavigate?: () => void }) {
                   <button
                     key={item.route}
                     onClick={() => { navigate(item.route); onNavigate?.(); }}
+                    aria-current={active ? "page" : undefined}
                     className={cn(
                       "relative w-full flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-sm font-medium transition-all duration-150 group",
                       active
@@ -166,11 +167,26 @@ export function Sidebar() {
 
 export function MobileNav() {
   const { sidebarOpen, setSidebarOpen } = useCrmStore();
+
+  useEffect(() => {
+    if (!sidebarOpen) return;
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setSidebarOpen(false);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.body.style.overflow = prevOverflow;
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [sidebarOpen, setSidebarOpen]);
+
   if (!sidebarOpen) return null;
   return (
     <div className="md:hidden fixed inset-0 z-50 flex">
-      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={() => setSidebarOpen(false)} />
-      <aside className="relative w-72 max-w-[80vw] bg-sidebar border-r border-border/60 flex flex-col">
+      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={() => setSidebarOpen(false)} aria-hidden="true" />
+      <aside role="dialog" aria-modal="true" aria-label="Navigation menu" className="relative w-72 max-w-[80vw] bg-sidebar border-r border-border/60 flex flex-col">
         <div className="h-16 flex items-center justify-between px-5 border-b border-border/60 shrink-0">
           <div className="flex items-center gap-2.5">
             <div className="h-9 w-9 rounded-xl bg-gradient-to-br from-primary to-primary/70 flex items-center justify-center text-primary-foreground shadow-glow">

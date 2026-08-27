@@ -25,6 +25,7 @@ export function MobileBottomNav() {
             <button
               key={item.route}
               onClick={() => navigate(item.route)}
+              aria-current={active ? "page" : undefined}
               className={cn(
                 "flex flex-col items-center justify-center gap-0.5 px-2 py-1.5 rounded-lg transition-all min-w-[56px]",
                 active ? "text-primary" : "text-muted-foreground hover:text-foreground",
