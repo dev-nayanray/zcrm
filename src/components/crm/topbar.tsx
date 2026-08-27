@@ -1,0 +1,154 @@
+"use client";
+import { useEffect, useState } from "react";
+import { useCrmStore } from "@/lib/store";
+import { api } from "@/lib/api-client";
+import { Button } from "@/components/ui/button";
+import { Sheet, SheetContent, SheetTrigger } from "@/components/ui/sheet";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import { Avatar, AvatarFallback } from "@/components/ui/avatar";
+import { Bell, LogOut, Menu, Moon, Plus, Search, Sun, User as UserIcon } from "lucide-react";
+import { toast } from "sonner";
+import { Input } from "@/components/ui/input";
+import { MobileNav } from "./sidebar";
+
+export function Topbar() {
+  const { user, theme, toggleTheme, setUser, navigate, sidebarOpen, setSidebarOpen } = useCrmStore();
+  const [notifOpen, setNotifOpen] = useState(false);
+  const [notifications, setNotifications] = useState<{ id: string; title: string; message: string; isRead: boolean; link?: string }[]>([]);
+  const [unread, setUnread] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    const doLoad = async () => {
+      try {
+        const res = await api.get<{ items: any[] }>("/api/v1/notifications?limit=10");
+        if (cancelled) return;
+        setNotifications(res.items);
+        setUnread(res.items.filter((n) => !n.isRead).length);
+      } catch { /* ignore */ }
+    };
+    doLoad();
+    const t = setInterval(doLoad, 60000);
+    return () => { cancelled = true; clearInterval(t); };
+  }, []);
+
+  async function markAllRead() {
+    try {
+      await api.patch("/api/v1/notifications");
+      // refresh
+      const res = await api.get<{ items: any[] }>("/api/v1/notifications?limit=10");
+      setNotifications(res.items);
+      setUnread(res.items.filter((n) => !n.isRead).length);
+    } catch (e) { toast.error((e as Error).message); }
+  }
+
+  async function logout() {
+    try {
+      await api.post("/api/v1/auth/logout");
+      setUser(null);
+      toast.success("Signed out");
+    } catch (e) { toast.error((e as Error).message); }
+  }
+
+  const initials = (user?.name || "U").split(" ").map((p) => p[0]).slice(0, 2).join("").toUpperCase();
+
+  return (
+    <>
+      <header className="h-16 border-b border-border/60 glass top-0 z-40 flex items-center gap-2 px-3 md:px-6 shrink-0">
+        <Button variant="ghost" size="icon" className="md:hidden hover:bg-accent" onClick={() => setSidebarOpen(!sidebarOpen)}>
+          <Menu className="h-5 w-5" />
+        </Button>
+        <div className="hidden sm:flex flex-1 max-w-md relative">
+          <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground pointer-events-none" />
+          <Input
+            placeholder="Search customers, products, orders…"
+            className="pl-9 h-9 bg-muted/50 border-transparent focus-visible:bg-card"
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                const q = (e.target as HTMLInputElement).value.trim();
+                if (!q) return;
+                navigate("orders", { search: q });
+              }
+            }}
+          />
+          <kbd className="hidden lg:inline-flex absolute right-3 top-1/2 -translate-y-1/2 items-center gap-0.5 rounded border border-border/60 bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground pointer-events-none">⏎</kbd>
+        </div>
+        <div className="flex-1 sm:hidden" />
+        <Button size="sm" className="hidden sm:inline-flex shadow-soft" onClick={() => navigate("orders/new")}>
+          <Plus className="h-4 w-4 mr-1" /> New Order
+        </Button>
+        <Button variant="ghost" size="icon" onClick={toggleTheme} aria-label="Toggle theme" className="hover:bg-accent">
+          {theme === "light" ? <Moon className="h-[18px] w-[18px]" /> : <Sun className="h-[18px] w-[18px]" />}
+        </Button>
+        <DropdownMenu open={notifOpen} onOpenChange={setNotifOpen}>
+          <DropdownMenuTrigger asChild>
+            <Button variant="ghost" size="icon" className="relative hover:bg-accent" aria-label="Notifications">
+              <Bell className="h-[18px] w-[18px]" />
+              {unread > 0 && <span className="absolute -top-0.5 -right-0.5 h-4 min-w-4 px-1.5 text-[10px] font-semibold bg-destructive text-destructive-foreground rounded-full flex items-center justify-center ring-2 ring-card">{unread}</span>}
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="w-80 p-0 shadow-pop">
+            <div className="flex items-center justify-between px-3 py-2.5 border-b border-border/60">
+              <span className="text-sm font-semibold">Notifications</span>
+              <Button variant="ghost" size="sm" className="h-7 text-xs" onClick={markAllRead}>Mark all read</Button>
+            </div>
+            <div className="max-h-80 overflow-y-auto">
+              {notifications.length === 0 ? (
+                <div className="py-8 text-center text-sm text-muted-foreground">No notifications</div>
+              ) : (
+                notifications.map((n) => (
+                  <button
+                    key={n.id}
+                    onClick={() => { if (n.link) navigate("notifications"); setNotifOpen(false); }}
+                    className="w-full text-left px-3 py-2.5 hover:bg-accent border-b border-border/40 last:border-0 transition-colors"
+                  >
+                    <div className="flex items-start gap-2.5">
+                      <span className={`mt-1 h-2 w-2 rounded-full shrink-0 ${n.isRead ? "bg-transparent" : "bg-primary"}`} />
+                      <div className="min-w-0">
+                        <p className="text-sm font-medium truncate">{n.title}</p>
+                        <p className="text-xs text-muted-foreground line-clamp-2 mt-0.5">{n.message}</p>
+                      </div>
+                    </div>
+                  </button>
+                ))
+              )}
+            </div>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem onClick={() => navigate("notifications")} className="py-2 justify-center font-medium">View all notifications</DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button variant="ghost" className="h-10 gap-2 px-1.5 hover:bg-accent rounded-full">
+              <Avatar className="h-8 w-8 ring-2 ring-border"><AvatarFallback className="bg-primary/10 text-primary text-xs font-semibold">{initials}</AvatarFallback></Avatar>
+              <span className="hidden sm:inline text-sm font-medium">{user?.name}</span>
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="w-56 shadow-pop">
+            <DropdownMenuLabel>
+              <div className="flex flex-col">
+                <span>{user?.name}</span>
+                <span className="text-xs text-muted-foreground font-normal">{user?.email}</span>
+                <span className="text-[10px] mt-1 inline-flex items-center px-1.5 py-0.5 rounded bg-secondary text-secondary-foreground w-fit">{user?.role}</span>
+              </div>
+            </DropdownMenuLabel>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem onClick={() => navigate("profile")}>
+              <UserIcon className="h-4 w-4 mr-2" /> Profile
+            </DropdownMenuItem>
+            <DropdownMenuItem onClick={() => navigate("settings")}>
+              <UserIcon className="h-4 w-4 mr-2" /> Settings
+            </DropdownMenuItem>
+            <DropdownMenuItem onClick={logout}>
+              <LogOut className="h-4 w-4 mr-2" /> Sign out
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </header>
+      <MobileNav />
+    </>
+  );
+}
+
+// silence unused
+void Sheet; void SheetContent; void SheetTrigger;

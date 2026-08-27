@@ -1,0 +1,1395 @@
+// Z-CRM: Custom Business CRM + Order Management + Inventory + Accounting + P&L
+// SQLite datasource (sandbox). All financial fields use Decimal (stored as TEXT in SQLite).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Auth, Users, Roles & Permissions
+// ---------------------------------------------------------------------------
+
+model User {
+  id            String   @id @default(cuid())
+  email         String   @unique
+  name          String
+  phone         String?
+  passwordHash  String
+  roleId        String
+  role          Role     @relation(fields: [roleId], references: [id], onDelete: Restrict)
+  isActive      Boolean  @default(true)
+  lastLoginAt   DateTime?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  payments      Payment[]
+  orders        Order[]
+  purchases     Purchase[]
+  expenses      Expense[]
+  returns       Return[]
+  refunds       Refund[]
+  stockMovements StockMovement[]
+  stockTransfers StockTransfer[]
+  auditLogs     AuditLog[]
+  notifications Notification[]
+  conversationsAssigned Conversation[] @relation("ConversationAssignee")
+  messagesSent   Message[]
+  metaConnections MetaConnection[]
+  whatsappConnections WhatsAppConnection[]
+  leadAssignees  LeadFollowUp[] @relation("LeadAssignee")
+  pipelineAssignees SalesPipelineEntry[] @relation("PipelineAssignee")
+  stockCountBy   StockCount[] @relation("StockCountBy")
+  stockCountApprover StockCount[] @relation("StockCountApprover")
+  telegramUsers  TelegramUser[]
+  subscriptions  Subscription[]
+  paymentOrders  PaymentOrder[]
+  wallet         Wallet?
+  walletTransactions WalletTransaction[]
+  payoutRequests PayoutRequest[] @relation("PayoutRequester")
+  payoutApprovals PayoutRequest[] @relation("PayoutApprover")
+
+  @@index([roleId])
+}
+
+model Role {
+  id          String   @id @default(cuid())
+  name        String   @unique // SUPER_ADMIN, ADMIN, MANAGER, SALES, INVENTORY, ACCOUNTANT
+  description String?
+  isSystem    Boolean  @default(false) // system roles cannot be deleted
+  permissions Permission[]
+  users       User[]
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model Permission {
+  id     String @id @default(cuid())
+  action String @unique // e.g. orders:read, orders:create
+  role   Role[]
+}
+
+// ---------------------------------------------------------------------------
+// CRM: Customers, Categories, Products, Suppliers, Channels
+// ---------------------------------------------------------------------------
+
+model Customer {
+  id         String   @id @default(cuid())
+  name       String
+  phone      String
+  email      String?
+  address    String?
+  city       String?
+  notes      String?
+  externalId String?  // WooCommerce customer id
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  orders    Order[]
+  payments  Payment[]
+  returns   Return[]
+  conversations Conversation[]
+  leads     MetaLead[]
+  salesPipelineEntries SalesPipelineEntry[]
+  customerCredit   CustomerCredit?
+
+  @@unique([phone])
+  @@index([externalId])
+  @@index([name])
+  @@index([city])
+}
+
+model Category {
+  id          String   @id @default(cuid())
+  name        String
+  slug        String   @unique
+  description String?
+  imageUrl    String?
+  parentId    String?
+  parent      Category?  @relation("CategoryTree", fields: [parentId], references: [id], onDelete: SetNull)
+  children    Category[] @relation("CategoryTree")
+  status      String   @default("ACTIVE") // ACTIVE | INACTIVE
+  sortOrder   Int      @default(0)
+  externalId  String?
+  products    Product[]
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([parentId])
+  @@index([externalId])
+}
+
+model Product {
+  id               String   @id @default(cuid())
+  sku              String   @unique
+  name             String
+  slug             String   @unique
+  description      String?
+  categoryId       String?
+  category         Category? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  brand            String?
+  purchasePrice    Decimal  @default(0)
+  sellingPrice     Decimal  @default(0)
+  wholesalePrice   Decimal  @default(0)
+  minimumStockLevel Decimal @default(0)
+  imageUrl         String?
+  status           String   @default("ACTIVE") // ACTIVE | INACTIVE
+  externalId       String?
+  inventory        Inventory?
+  orderItems       OrderItem[]
+  purchaseItems    PurchaseItem[]
+  stockMovements   StockMovement[]
+  returnItems      ReturnItem[]
+  warehouseStock   WarehouseStock[]
+  transferItems    StockTransferItem[]
+  stockCountItems  StockCountItem[]
+  productVariants  ProductVariant[]
+  purchaseReturnItems PurchaseReturnItem[]
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@index([categoryId])
+  @@index([externalId])
+  @@index([status])
+  @@index([name])
+}
+
+model Supplier {
+  id        String   @id @default(cuid())
+  name      String
+  phone     String?
+  email     String?
+  address   String?
+  company   String?
+  notes     String?
+  purchases Purchase[]
+  supplierPayments SupplierPayment[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([name])
+}
+
+model Channel {
+  id        String   @id @default(cuid())
+  name      String   @unique // Website, Facebook, Messenger, WhatsApp, Instagram, Phone, Physical Store, Other
+  isSystem  Boolean  @default(false)
+  orders    Order[]
+  conversations Conversation[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Orders & Order Items (with historical snapshots)
+// ---------------------------------------------------------------------------
+
+model Order {
+  id            String   @id @default(cuid())
+  orderNumber   String   @unique
+  customerId    String
+  customer      Customer @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  channelId     String
+  channel       Channel @relation(fields: [channelId], references: [id], onDelete: Restrict)
+  status        String   @default("PENDING") // PENDING|CONFIRMED|PROCESSING|SHIPPED|DELIVERED|CANCELLED|RETURNED|REFUNDED
+  paymentStatus String   @default("UNPAID") // UNPAID|PARTIAL|PAID|REFUNDED
+  subtotal      Decimal  @default(0)
+  discount      Decimal  @default(0)
+  shippingCost  Decimal  @default(0)
+  otherCost     Decimal  @default(0)
+  total         Decimal  @default(0)
+  paidAmount    Decimal  @default(0)
+  externalId    String?  // WooCommerce order id
+  syncStatus    String   @default("LOCAL") // LOCAL|SYNCED|FAILED
+  sourceChannel String?  // legacy label
+  stockReserved Boolean  @default(false) // true = stock reserved (not yet sold)
+  conversationId String? // link to the omnichannel conversation that produced this order
+  notes         String?
+  createdBy     String?
+  creator       User?    @relation(fields: [createdBy], references: [id], onDelete: SetNull)
+  statusHistory OrderStatusHistory[]
+  items         OrderItem[]
+  payments      Payment[]
+  returns       Return[]
+  refunds       Refund[]
+  delivery      Delivery?
+  conversation Conversation? @relation("ConversationOrders", fields: [conversationId], references: [id], onDelete: SetNull)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([customerId])
+  @@index([channelId])
+  @@index([status])
+  @@index([paymentStatus])
+  @@index([externalId])
+  @@index([createdAt])
+}
+
+model OrderItem {
+  id          String   @id @default(cuid())
+  orderId     String
+  order       Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  productId   String
+  product     Product  @relation(fields: [productId], references: [id], onDelete: Restrict)
+  productName String   // snapshot
+  sku         String   // snapshot
+  quantity    Decimal 
+  unitPrice   Decimal  // snapshot selling price
+  unitCost   Decimal  // snapshot purchase cost (COGS)
+  discount    Decimal  @default(0)
+  total       Decimal  @default(0)
+  createdAt   DateTime @default(now())
+
+  @@index([orderId])
+  @@index([productId])
+}
+
+model OrderStatusHistory {
+  id        String   @id @default(cuid())
+  orderId   String
+  order     Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  status    String
+  note      String?
+  createdBy String?
+  createdAt DateTime @default(now())
+
+  @@index([orderId])
+}
+
+// ---------------------------------------------------------------------------
+// Payments
+// ---------------------------------------------------------------------------
+
+model Payment {
+  id                 String   @id @default(cuid())
+  orderId            String
+  order              Order    @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  customerId        String
+  customer           Customer @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  amount             Decimal 
+  method             String   // CASH|BKASH|NAGAD|BANK|CARD|OTHER
+  transactionReference String?
+  notes              String?
+  createdBy          String?
+  creator            User?    @relation(fields: [createdBy], references: [id], onDelete: SetNull)
+  refunds            Refund[]
+  createdAt          DateTime @default(now())
+
+  @@index([orderId])
+  @@index([customerId])
+  @@index([method])
+  @@index([createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Inventory & Stock Movements (ledger)
+// ---------------------------------------------------------------------------
+
+model Inventory {
+  id               String   @id @default(cuid())
+  productId        String   @unique
+  product          Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  quantity         Decimal  @default(0)         // physical (sellable) stock
+  reservedQuantity Decimal  @default(0)         // reserved for pending orders
+  damagedQuantity  Decimal  @default(0)         // damaged bucket
+  minimumStock     Decimal  @default(0)         // low-stock threshold
+  maximumStock     Decimal  @default(0)         // ceiling (advisory)
+  reorderLevel     Decimal  @default(0)         // when to reorder
+  warehouseId      String?
+  warehouse       Warehouse? @relation(fields: [warehouseId], references: [id], onDelete: SetNull)
+  updatedAt        DateTime @updatedAt
+
+  @@index([warehouseId])
+}
+
+model StockMovement {
+  id               String   @id @default(cuid())
+  productId        String
+  product          Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  type             String   // PURCHASE|SALE|RETURN|DAMAGE|ADJUSTMENT|TRANSFER_IN|TRANSFER_OUT|RESERVATION|RELEASE
+  quantityChange   Decimal  // signed
+  previousQuantity Decimal
+  newQuantity      Decimal
+  referenceType   String?  // ORDER|PURCHASE|RETURN|TRANSFER|MANUAL|WEBHOOK
+  referenceId     String?
+  reason          String?
+  createdBy       String?
+  creator         User?    @relation(fields: [createdBy], references: [id], onDelete: SetNull)
+  warehouseId     String?
+  warehouse       Warehouse? @relation(fields: [warehouseId], references: [id], onDelete: SetNull)
+  createdAt       DateTime @default(now())
+
+  @@index([productId])
+  @@index([type])
+  @@index([createdAt])
+  @@index([referenceType, referenceId])
+  @@index([warehouseId])
+}
+
+// ---------------------------------------------------------------------------
+// Multi-warehouse support (designed so multiple warehouses can be enabled later)
+// ---------------------------------------------------------------------------
+
+model Warehouse {
+  id         String   @id @default(cuid())
+  name       String   @unique
+  code       String   @unique
+  address    String?
+  isDefault  Boolean  @default(false)
+  isActive   Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  inventory      Inventory[]
+  stockMovements StockMovement[]
+  warehouseStock WarehouseStock[]
+  transfersFrom  StockTransfer[] @relation("TransferFrom")
+  transfersTo    StockTransfer[] @relation("TransferTo")
+  stockCounts    StockCount[]
+}
+
+model WarehouseStock {
+  id               String   @id @default(cuid())
+  warehouseId      String
+  warehouse        Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+  productId        String
+  product          Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  quantity         Decimal  @default(0)
+  reservedQuantity Decimal  @default(0)
+  damagedQuantity  Decimal  @default(0)
+  updatedAt        DateTime @updatedAt
+
+  @@unique([warehouseId, productId])
+  @@index([productId])
+}
+
+model StockTransfer {
+  id              String   @id @default(cuid())
+  transferNumber   String  @unique
+  fromWarehouseId  String
+  fromWarehouse    Warehouse @relation("TransferFrom", fields: [fromWarehouseId], references: [id], onDelete: Restrict)
+  toWarehouseId    String
+  toWarehouse      Warehouse @relation("TransferTo", fields: [toWarehouseId], references: [id], onDelete: Restrict)
+  status           String   @default("PENDING") // PENDING|COMPLETED|CANCELLED
+  notes            String?
+  createdBy        String?
+  creator          User?    @relation(fields: [createdBy], references: [id], onDelete: SetNull)
+  items            StockTransferItem[]
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@index([fromWarehouseId])
+  @@index([toWarehouseId])
+  @@index([status])
+}
+
+model StockTransferItem {
+  id          String   @id @default(cuid())
+  transferId  String
+  transfer    StockTransfer @relation(fields: [transferId], references: [id], onDelete: Cascade)
+  productId   String
+  product     Product  @relation(fields: [productId], references: [id], onDelete: Restrict)
+  quantity    Decimal
+  createdAt   DateTime @default(now())
+
+  @@index([transferId])
+  @@index([productId])
+}
+
+// ---------------------------------------------------------------------------
+// Purchases
+// ---------------------------------------------------------------------------
+
+model Purchase {
+  id            String   @id @default(cuid())
+  purchaseNumber String  @unique
+  supplierId    String
+  supplier      Supplier @relation(fields: [supplierId], references: [id], onDelete: Restrict)
+  status        String   @default("PENDING") // PENDING|RECEIVED|CANCELLED
+  subtotal      Decimal  @default(0)
+  discount      Decimal  @default(0)
+  shippingCost  Decimal  @default(0)
+  total         Decimal  @default(0)
+  paidAmount    Decimal  @default(0)
+  dueAmount     Decimal  @default(0)
+  paymentStatus String   @default("UNPAID") // UNPAID|PARTIAL|PAID
+  notes         String?
+  createdBy     String?
+  creator       User?    @relation(fields: [createdBy], references: [id], onDelete: SetNull)
+  items         PurchaseItem[]
+  purchaseReturns PurchaseReturn[]
+  supplierPayments SupplierPayment[]
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([supplierId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model PurchaseItem {
+  id          String   @id @default(cuid())
+  purchaseId  String
+  purchase    Purchase @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
+  productId   String
+  product     Product  @relation(fields: [productId], references: [id], onDelete: Restrict)
+  quantity    Decimal 
+  unitCost    Decimal 
+  total       Decimal 
+  createdAt   DateTime @default(now())
+
+  @@index([purchaseId])
+  @@index([productId])
+}
+
+// ---------------------------------------------------------------------------
+// Expenses
+// ---------------------------------------------------------------------------
+
+model ExpenseCategory {
+  id        String   @id @default(cuid())
+  name      String   @unique // Delivery|Packaging|Marketing|Salary|Rent|Utility|Office|Transport|Other
+  isSystem  Boolean  @default(false)
+  expenses  Expense[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Expense {
+  id            String   @id @default(cuid())
+  categoryId    String
+  category      ExpenseCategory @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  amount        Decimal 
+  paymentMethod String   // CASH|BKASH|NAGAD|BANK|CARD|OTHER
+  description   String?
+  reference     String?
+  expenseDate   DateTime @default(now())
+  createdBy     String?
+  creator       User?    @relation(fields: [createdBy], references: [id], onDelete: SetNull)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([categoryId])
+  @@index([expenseDate])
+  @@index([paymentMethod])
+}
+
+// ---------------------------------------------------------------------------
+// Returns & Refunds
+// ---------------------------------------------------------------------------
+
+model Return {
+  id            String   @id @default(cuid())
+  orderId       String
+  order         Order    @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  status        String   @default("PENDING") // PENDING|COMPLETED|CANCELLED
+  type          String   @default("RETURN") // RETURN|EXCHANGE
+  reason        String?
+  refundAmount  Decimal  @default(0)
+  customerId    String
+  customer      Customer @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  items         ReturnItem[]
+  refunds       Refund[]
+  createdBy     String?
+  creator       User?    @relation(fields: [createdBy], references: [id], onDelete: SetNull)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([orderId])
+  @@index([customerId])
+  @@index([status])
+}
+
+model ReturnItem {
+  id          String   @id @default(cuid())
+  returnId    String
+  return      Return   @relation(fields: [returnId], references: [id], onDelete: Cascade)
+  productId   String
+  product     Product  @relation(fields: [productId], references: [id], onDelete: Restrict)
+  quantity    Decimal 
+  condition   String   @default("GOOD") // GOOD|DAMAGED
+  createdAt   DateTime @default(now())
+
+  @@index([returnId])
+  @@index([productId])
+}
+
+model Refund {
+  id                 String   @id @default(cuid())
+  orderId            String
+  order              Order    @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  paymentId          String?
+  payment            Payment? @relation(fields: [paymentId], references: [id], onDelete: SetNull)
+  returnId           String?
+  return             Return?  @relation(fields: [returnId], references: [id], onDelete: SetNull)
+  amount             Decimal 
+  method             String   // CASH|BKASH|NAGAD|BANK|CARD|OTHER
+  transactionReference String?
+  notes              String?
+  createdBy          String?
+  creator            User?    @relation(fields: [createdBy], references: [id], onDelete: SetNull)
+  createdAt          DateTime @default(now())
+
+  @@index([orderId])
+  @@index([returnId])
+  @@index([paymentId])
+}
+
+// ---------------------------------------------------------------------------
+// Integrations & Sync Logs (WooCommerce)
+// ---------------------------------------------------------------------------
+
+model Integration {
+  id            String   @id @default(cuid())
+  name          String   @unique // woocommerce
+  config        String   // JSON blob (encrypted at rest in production)
+  status        String   @default("DISCONNECTED") // CONNECTED|DISCONNECTED|ERROR
+  lastSyncAt    DateTime?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+model SyncLog {
+  id           String   @id @default(cuid())
+  entity       String   // product|customer|order
+  externalId   String
+  operation    String   // create|update|delete
+  status       String   @default("PENDING") // PENDING|SUCCESS|FAILED
+  message      String?
+  attemptCount Int      @default(0)
+  payload      String?  // JSON snapshot
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@unique([entity, externalId, operation])
+  @@index([status])
+  @@index([entity])
+}
+
+// ---------------------------------------------------------------------------
+// Omnichannel: Conversations, Messages, Message Templates
+// Conversations unify WhatsApp / Facebook Messenger / Instagram into one inbox.
+// All channels reuse the SAME core services (Customer/Order/Inventory/Payment).
+// ---------------------------------------------------------------------------
+
+model Conversation {
+  id                     String   @id @default(cuid())
+  provider               String   // whatsapp | facebook | instagram | messenger
+  externalConversationId String?
+  providerConnectionId   String?  // MetaConnection.id or WhatsAppConnection.id
+  customerId            String?
+  customer              Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  channelId             String?
+  channel               Channel? @relation(fields: [channelId], references: [id], onDelete: SetNull)
+  contactName           String?
+  contactPhone          String?
+  status                String   @default("OPEN") // OPEN|PENDING|RESOLVED|CLOSED
+  unreadCount          Int      @default(0)
+  lastMessageAt         DateTime?
+  lastMessagePreview    String?
+  assignedUserId        String?
+  assignee              User?    @relation("ConversationAssignee", fields: [assignedUserId], references: [id], onDelete: SetNull)
+  metaPayload           String?  // JSON snapshot of last provider payload
+  orders                Order[]  @relation("ConversationOrders")
+  messages              Message[]
+  tags                  ConversationTag[]
+  notes                 ConversationNote[]
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  @@index([provider])
+  @@index([customerId])
+  @@index([status])
+  @@index([assignedUserId])
+  @@index([lastMessageAt])
+}
+
+model Message {
+  id            String   @id @default(cuid())
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  direction      String   // INCOMING | OUTGOING
+  provider       String   // whatsapp | facebook | instagram | messenger | system
+  externalMessageId String?
+  body           String
+  mediaType     String   @default("text") // text|image|audio|video|document|template
+  mediaUrl       String?
+  templateId     String?
+  status         String   @default("SENT") // PENDING|SENT|DELIVERED|READ|FAILED
+  errorMessage   String?
+  sentBy         String?  // userId for OUTGOING, null for INCOMING
+  sender         User?    @relation(fields: [sentBy], references: [id], onDelete: SetNull)
+  createdAt      DateTime @default(now())
+
+  @@index([conversationId])
+  @@index([direction])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model MessageTemplate {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  channel     String   // whatsapp | messenger | email
+  category    String   @default("TRANSACTIONAL") // TRANSACTIONAL|MARKETING|UTILITY
+  language    String   @default("en")
+  subject     String?
+  body        String   // supports {{customer_name}}, {{order_number}}, etc.
+  variables   String?  // JSON array of variable names
+  isApproved  Boolean  @default(false) // WhatsApp templates must be approved
+  externalId  String?  // WhatsApp template id (wamid)
+  status      String   @default("ACTIVE") // ACTIVE|INACTIVE|PENDING
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([channel])
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// Meta / Facebook / Instagram connections & leads
+// ---------------------------------------------------------------------------
+
+model MetaConnection {
+  id                String   @id @default(cuid())
+  name              String   // connection label
+  facebookPageId    String?
+  facebookPageName  String?
+  instagramBusinessId String?
+  instagramUsername String?
+  accessToken       String   // server-only — NEVER returned to client
+  appSecret         String?  // server-only — Meta App Secret for webhook signature verification
+  tokenExpiresAt    DateTime?
+  appId             String?
+  connectedUserId   String?  // Meta user id of the admin who connected
+  webhookVerifyToken String?
+  status            String   @default("DISCONNECTED") // CONNECTED|DISCONNECTED|EXPIRED|ERROR
+  lastSyncAt        DateTime?
+  createdBy         String?
+  creator           User?    @relation(fields: [createdBy], references: [id], onDelete: SetNull)
+  leads             MetaLead[]
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@index([status])
+  @@index([facebookPageId])
+}
+
+model MetaLead {
+  id            String   @id @default(cuid())
+  connectionId  String?
+  connection    MetaConnection? @relation(fields: [connectionId], references: [id], onDelete: SetNull)
+  externalLeadId String  @unique // Meta leadgen id
+  name          String
+  phone         String?
+  email         String?
+  source        String?  // page / form name
+  campaign      String?
+  ad            String?
+  form          String?
+  customerId    String?  // matched/created CRM customer
+  customer      Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  status        String   @default("NEW") // NEW|CONTACTED|QUALIFIED|FOLLOW_UP|CONVERTED|LOST
+  notes         String?
+  payload       String?  // raw JSON
+  followUp      LeadFollowUp?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([connectionId])
+  @@index([customerId])
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// WhatsApp Business (Cloud API) connections
+// ---------------------------------------------------------------------------
+
+model WhatsAppConnection {
+  id                String   @id @default(cuid())
+  name              String   // connection label
+  phoneNumberId     String  @unique
+  phoneNumber       String?  // E.164 display number
+  businessAccountId String?
+  wabaId            String?  // WhatsApp Business Account id
+  accessToken       String  // server-only — NEVER returned to client
+  appSecret         String?  // server-only — Meta App Secret for webhook signature verification
+  webhookVerifyToken String?
+  status            String   @default("DISCONNECTED") // CONNECTED|DISCONNECTED|ERROR
+  lastSyncAt        DateTime?
+  createdBy         String?
+  creator           User?    @relation(fields: [createdBy], references: [id], onDelete: SetNull)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// Webhook event log (idempotency + retry for all providers)
+// ---------------------------------------------------------------------------
+
+model WebhookEvent {
+  id            String   @id @default(cuid())
+  provider      String   // meta | whatsapp | woocommerce
+  eventId       String   // provider's unique event id
+  eventType     String?
+  payloadHash   String?  // sha256 of payload for dedup
+  status        String   @default("PENDING") // PENDING|SUCCESS|FAILED|RETRYING|IGNORED
+  error         String?
+  retryCount    Int      @default(0)
+  processedAt   DateTime?
+  payload       String?  // JSON snapshot
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@unique([provider, eventId])
+  @@index([provider])
+  @@index([status])
+  @@index([createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Notifications, Audit Logs, Settings
+// ---------------------------------------------------------------------------
+
+model Notification {
+  id        String   @id @default(cuid())
+  type      String   // LOW_STOCK|NEW_ORDER|PAYMENT_RECEIVED|SYNC_FAILED|PENDING_PAYMENT|PURCHASE_DUE
+  title     String
+  message   String
+  link      String?
+  isRead    Boolean  @default(false)
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  createdAt DateTime @default(now())
+
+  @@index([userId, isRead])
+  @@index([createdAt])
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  action    String   // e.g. ORDER_CREATE, PAYMENT_CREATE, STOCK_ADJUST
+  entity    String
+  entityId  String?
+  changes   String?  // JSON diff
+  ipAddress String?
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([action])
+  @@index([entity, entityId])
+  @@index([createdAt])
+}
+
+model Setting {
+  id        String   @id @default(cuid())
+  key       String   @unique
+  value     String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// PRODUCTION HARDENING — Delivery, Couriers, Automation, Cash, Pipeline,
+// Stock Reconciliation, Product Variants, Purchase Returns, Supplier Payments
+// (All reuse existing core services; no duplicate business logic.)
+// ---------------------------------------------------------------------------
+
+// --- Delivery management + Bangladesh courier abstraction ---
+
+model Delivery {
+  id              String   @id @default(cuid())
+  orderId         String  @unique
+  order           Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  courierProviderId String?
+  courierProvider CourierProvider? @relation(fields: [courierProviderId], references: [id], onDelete: SetNull)
+  courierName     String?
+  trackingNumber  String?
+  deliveryCharge  Decimal  @default(0)
+  codAmount       Decimal  @default(0)
+  status          String   @default("PENDING") // PENDING|PACKED|SHIPPED|IN_TRANSIT|DELIVERED|FAILED|RETURNED
+  courierConsignmentId String? // provider's consignment/waybill id
+  recipientName   String?
+  recipientPhone  String?
+  recipientAddress String?
+  shippingDate    DateTime?
+  deliveredDate  DateTime?
+  notes           String?
+  createdBy       String?
+  statusHistory   DeliveryStatusHistory[]
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([status])
+  @@index([courierProviderId])
+  @@index([shippingDate])
+}
+
+model DeliveryStatusHistory {
+  id          String   @id @default(cuid())
+  deliveryId  String
+  delivery    Delivery @relation(fields: [deliveryId], references: [id], onDelete: Cascade)
+  status      String
+  note        String?
+  createdAt   DateTime @default(now())
+
+  @@index([deliveryId])
+}
+
+model CourierProvider {
+  id          String   @id @default(cuid())
+  name        String   @unique // Pathao | Steadfast | RedX | Other
+  code        String   @unique
+  apiUrl      String?
+  apiKey      String?  // server-only — never returned to client
+  secretKey   String? // server-only
+  isActive    Boolean  @default(true)
+  isMock      Boolean  @default(false) // when true, returns simulated responses
+  config      String? // JSON blob for provider-specific settings
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  deliveries Delivery[]
+}
+
+// --- Automation engine (event → rule → action → execution log) ---
+
+model AutomationRule {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  event       String   // ORDER_CREATED|PAYMENT_RECEIVED|STOCK_LOW|LEAD_CREATED|ORDER_DELIVERED|ORDER_CANCELLED|ORDER_SHIPPED|DUE_PAYMENT
+  action      String   // SEND_WHATSAPP_TEMPLATE|CREATE_NOTIFICATION|ASSIGN_SALES_USER|CONVERT_RESERVATION
+  templateName String? // for SEND_WHATSAPP_TEMPLATE
+  targetRole  String?  // for ASSIGN_SALES_USER (assign to first user with this role)
+  isActive    Boolean  @default(true)
+  config      String?  // JSON: condition + extra params
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  executions  AutomationExecution[]
+
+  @@index([event, isActive])
+}
+
+model AutomationExecution {
+  id          String   @id @default(cuid())
+  ruleId      String
+  rule        AutomationRule @relation(fields: [ruleId], references: [id], onDelete: Cascade)
+  event       String
+  entityId    String?
+  status      String   @default("PENDING") // PENDING|SUCCESS|FAILED|SKIPPED
+  error       String?
+  result      String?
+  createdAt   DateTime @default(now())
+
+  @@index([ruleId])
+  @@index([status])
+  @@index([entityId])
+}
+
+// --- Cash register / cash summary (computed; this stores daily snapshots) ---
+
+model CashRegister {
+  id            String   @id @default(cuid())
+  date          DateTime
+  openingBalance Decimal @default(0)
+  cashSales     Decimal  @default(0)
+  customerPayments Decimal @default(0)
+  refunds       Decimal  @default(0)
+  expenses      Decimal  @default(0)
+  closingBalance Decimal @default(0)
+  notes         String?
+  closedBy      String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@unique([date])
+  @@index([date])
+}
+
+// --- Conversation tags + internal notes ---
+
+model ConversationTag {
+  id             String   @id @default(cuid())
+  conversationId String
+  conversation    Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  tag            String   // NEW_LEAD|EXISTING_CUSTOMER|ORDER_QUERY|PAYMENT_QUERY|COMPLAINT|RETURN|VIP
+  createdBy      String?
+  createdAt      DateTime @default(now())
+
+  @@unique([conversationId, tag])
+  @@index([tag])
+}
+
+model ConversationNote {
+  id             String   @id @default(cuid())
+  conversationId String
+  conversation    Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  body           String
+  createdBy      String?
+  createdAt      DateTime @default(now())
+
+  @@index([conversationId])
+}
+
+// --- Lead pipeline + follow-up ---
+
+model LeadFollowUp {
+  id          String   @id @default(cuid())
+  leadId      String   @unique
+  lead        MetaLead @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  assignedToId String?
+  assignedTo  User?    @relation("LeadAssignee", fields: [assignedToId], references: [id], onDelete: SetNull)
+  pipelineStage String @default("NEW") // NEW|CONTACTED|QUALIFIED|NEGOTIATION|ORDER_CREATED|WON|LOST
+  followUpDate DateTime?
+  notes       String?
+  convertedCustomerId String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([pipelineStage])
+  @@index([assignedToId])
+  @@index([followUpDate])
+}
+
+// --- Sales pipeline (lightweight; reuses Customer + Conversation + Order) ---
+
+model SalesPipelineEntry {
+  id            String   @id @default(cuid())
+  customerId    String
+  customer      Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  conversationId String?
+  value         Decimal  @default(0)
+  stage         String   @default("NEW") // NEW|CONTACTED|QUALIFIED|NEGOTIATION|ORDER_CREATED|WON|LOST
+  expectedCloseDate DateTime?
+  assignedToId  String?
+  assignedTo    User?    @relation("PipelineAssignee", fields: [assignedToId], references: [id], onDelete: SetNull)
+  notes         String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([stage])
+  @@index([assignedToId])
+  @@index([customerId])
+}
+
+// --- Stock reconciliation / stock count ---
+
+model StockCount {
+  id            String   @id @default(cuid())
+  countNumber   String   @unique
+  warehouseId   String?
+  warehouse     Warehouse? @relation(fields: [warehouseId], references: [id], onDelete: SetNull)
+  status        String   @default("DRAFT") // DRAFT|PENDING_APPROVAL|APPROVED|REJECTED
+  notes         String?
+  createdBy     String?
+  creator       User?    @relation("StockCountBy", fields: [createdBy], references: [id], onDelete: SetNull)
+  approvedBy    String?
+  approver      User?    @relation("StockCountApprover", fields: [approvedBy], references: [id], onDelete: SetNull)
+  approvedAt    DateTime?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  items StockCountItem[]
+
+  @@index([status])
+  @@index([warehouseId])
+}
+
+model StockCountItem {
+  id            String   @id @default(cuid())
+  stockCountId  String
+  stockCount    StockCount @relation(fields: [stockCountId], references: [id], onDelete: Cascade)
+  productId     String
+  product       Product  @relation(fields: [productId], references: [id], onDelete: Restrict)
+  systemQuantity Decimal @default(0)
+  countedQuantity Decimal @default(0)
+  difference    Decimal @default(0)
+  createdAt     DateTime @default(now())
+
+  @@unique([stockCountId, productId])
+  @@index([stockCountId])
+}
+
+// --- Product variants + barcode ---
+
+model ProductVariant {
+  id          String   @id @default(cuid())
+  productId   String
+  product     Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  sku         String   @unique
+  barcode     String?  @unique
+  name        String   // e.g. "Red / L"
+  attributes  String?  // JSON: {color, size, ...}
+  purchasePrice Decimal @default(0)
+  sellingPrice Decimal @default(0)
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([productId])
+  @@index([barcode])
+}
+
+// --- Purchase returns + supplier payments ---
+
+model PurchaseReturn {
+  id            String   @id @default(cuid())
+  returnNumber  String   @unique
+  purchaseId    String
+  purchase      Purchase @relation(fields: [purchaseId], references: [id], onDelete: Restrict)
+  status        String   @default("PENDING") // PENDING|COMPLETED|CANCELLED
+  total         Decimal  @default(0)
+  reason        String?
+  createdBy     String?
+  items         PurchaseReturnItem[]
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([purchaseId])
+  @@index([status])
+}
+
+model PurchaseReturnItem {
+  id          String   @id @default(cuid())
+  returnId    String
+  return      PurchaseReturn @relation(fields: [returnId], references: [id], onDelete: Cascade)
+  productId   String
+  product     Product  @relation(fields: [productId], references: [id], onDelete: Restrict)
+  quantity    Decimal
+  unitCost    Decimal
+  total       Decimal
+  createdAt   DateTime @default(now())
+
+  @@index([returnId])
+  @@index([productId])
+}
+
+model SupplierPayment {
+  id            String   @id @default(cuid())
+  supplierId    String
+  supplier      Supplier @relation(fields: [supplierId], references: [id], onDelete: Restrict)
+  purchaseId    String?
+  purchase      Purchase? @relation(fields: [purchaseId], references: [id], onDelete: SetNull)
+  amount        Decimal
+  method        String   // CASH|BKASH|NAGAD|BANK|CARD|OTHER
+  transactionReference String?
+  notes         String?
+  createdBy     String?
+  createdAt     DateTime @default(now())
+
+  @@index([supplierId])
+  @@index([purchaseId])
+  @@index([createdAt])
+}
+
+// --- Customer advance / credit ledger (one row per customer, updated atomically) ---
+
+model CustomerCredit {
+  id            String   @id @default(cuid())
+  customerId    String   @unique
+  customer      Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  advanceAmount Decimal  @default(0) // advance payments (customer credit)
+  creditLimit   Decimal  @default(0)
+  notes         String?
+  updatedAt     DateTime @updatedAt
+}
+
+// --- Back-relation additions (need to add to existing models) ---
+// NOTE: the following back-relations must be added to existing models:
+//   Product:   deliveryItems? (no — OrderItem covers it), stockCountItems, productVariants, purchaseReturnItems
+//   Order:     delivery
+//   Conversation: conversationTags, conversationNotes
+//   MetaLead:  leadFollowUp
+//   Customer:  salesPipelineEntries, customerCredit
+//   Supplier:  supplierPayments
+//   Purchase:  purchaseReturns, supplierPayments
+//   User:      leadAssignees, pipelineAssignees, stockCountBy, stockCountApprover
+//   Warehouse: stockCounts
+
+// ---------------------------------------------------------------------------
+// TELEGRAM BOT — quick operational control center for Z-CRM.
+// Group → Role → Permission mapping. The SAME Telegram user can have different
+// roles in different groups. All CRM actions reuse existing services (no
+// duplicate business logic). Identity is by Telegram user ID (not username).
+// ---------------------------------------------------------------------------
+
+model TelegramBot {
+  id              String   @id @default(cuid())
+  name            String   @default("Z-CRM Bot")
+  botToken        String   @unique // server-only — NEVER returned to client
+  botUsername     String?
+  webhookUrl      String?
+  webhookSecret   String?
+  status          String   @default("DISCONNECTED") // CONNECTED|DISCONNECTED|ERROR
+  defaultLanguage String   @default("en") // en | bn
+  lastWebhookAt   DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  groups          TelegramGroup[]
+}
+
+model TelegramGroup {
+  id            String   @id @default(cuid())
+  botId         String
+  bot           TelegramBot @relation(fields: [botId], references: [id], onDelete: Cascade)
+  chatId        String   @unique // Telegram group/chat ID (numeric string)
+  chatTitle     String   // group display name
+  chatType      String   @default("group") // group | supergroup | private
+  roleName      String   @default("SALES") // SUPER_ADMIN|ADMIN|MANAGER|SALES|INVENTORY|ACCOUNTANT
+  isActive      Boolean  @default(true)
+  welcomeText   String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  memberships   TelegramGroupMembership[]
+  notifications TelegramNotificationRule[]
+  auditLogs     TelegramAuditLog[]
+}
+
+model TelegramUser {
+  id              String   @id @default(cuid())
+  telegramId      String   @unique // Telegram user ID (numeric string) — identity
+  username        String?
+  firstName       String?
+  lastName        String?
+  language        String   @default("en") // en | bn
+  crmUserId       String? // linked Z-CRM User (optional)
+  crmUser         User?    @relation(fields: [crmUserId], references: [id], onDelete: SetNull)
+  isBlocked       Boolean  @default(false)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  memberships     TelegramGroupMembership[]
+  auditLogs       TelegramAuditLog[]
+}
+
+model TelegramGroupMembership {
+  id            String   @id @default(cuid())
+  groupId       String
+  group         TelegramGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  userId        String
+  user          TelegramUser @relation(fields: [userId], references: [id], onDelete: Cascade)
+  roleName      String   @default("SALES") // role WITHIN this group
+  joinedAt      DateTime @default(now())
+
+  @@unique([groupId, userId])
+  @@index([groupId])
+  @@index([userId])
+}
+
+// Notification routing: CRM event → Telegram group(s)
+model TelegramNotificationRule {
+  id            String   @id @default(cuid())
+  groupId       String
+  group         TelegramGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  eventType     String   // NEW_ORDER|NEW_LEAD|NEW_MESSAGE|LOW_STOCK|OUT_OF_STOCK|PAYMENT_RECEIVED|DUE_PAYMENT|DELIVERY_UPDATE|STOCK_COUNT_APPROVAL|SYSTEM_ALERT|PURCHASE_DUE
+  isActive      Boolean  @default(true)
+  language      String   @default("en")
+  createdAt     DateTime @default(now())
+
+  @@unique([groupId, eventType])
+  @@index([eventType])
+}
+
+model TelegramAuditLog {
+  id            String   @id @default(cuid())
+  groupId       String?
+  group         TelegramGroup? @relation(fields: [groupId], references: [id], onDelete: SetNull)
+  userId        String?
+  user          TelegramUser? @relation(fields: [userId], references: [id], onDelete: SetNull)
+  telegramUserId String?
+  action        String   // COMMAND|CALLBACK|NOTIFICATION|WEBHOOK
+  command       String?
+  payload       String?  // JSON
+  result        String?
+  createdAt     DateTime @default(now())
+
+  @@index([groupId])
+  @@index([userId])
+  @@index([action])
+  @@index([createdAt])
+}
+
+// Idempotent webhook event log (Telegram update_id)
+model TelegramWebhookEvent {
+  id            String   @id @default(cuid())
+  updateId      String   @unique // Telegram update_id
+  status        String   @default("PROCESSED") // PROCESSED|FAILED|IGNORED
+  error         String?
+  payload       String?  // JSON snapshot
+  processedAt   DateTime @default(now())
+  createdAt     DateTime @default(now())
+
+  @@index([status])
+  @@index([createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// BILLING & PAYMENT SYSTEM — sell Z-CRM subscriptions, manage wallet,
+// accept payments via bKash/Nagad/Bank/Cash, process payouts.
+// ---------------------------------------------------------------------------
+
+model Subscription {
+  id            String   @id @default(cuid())
+  userId        String
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  plan          String   // WEEKLY | MONTHLY | YEARLY | LIFETIME
+  status        String   @default("ACTIVE") // ACTIVE | EXPIRED | CANCELLED | PAST_DUE | TRIALING
+  amount        Decimal  @default(0)
+  currency      String   @default("BDT")
+  billingCycle  String   // WEEKLY | MONTHLY | YEARLY | LIFETIME
+  startDate     DateTime @default(now())
+  endDate       DateTime? // null for LIFETIME
+  autoRenew     Boolean  @default(true)
+  trialEndsAt   DateTime?
+  cancelledAt   DateTime?
+  paymentOrders PaymentOrder[]
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([userId])
+  @@index([status])
+  @@index([endDate])
+}
+
+model PaymentOrder {
+  id              String   @id @default(cuid())
+  subscriptionId  String?
+  subscription    Subscription? @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
+  userId          String
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  orderNumber     String   @unique
+  plan            String   // WEEKLY | MONTHLY | YEARLY | LIFETIME
+  amount          Decimal
+  currency        String   @default("BDT")
+  method          String   // BKASH | NAGAD | BANK | CASH | SSLCOMMERZ | CARD | WALLET | MANUAL
+  gatewayId       String?
+  gateway         PaymentGateway? @relation(fields: [gatewayId], references: [id], onDelete: SetNull)
+  status          String   @default("PENDING") // PENDING | PAID | FAILED | REFUNDED | CANCELLED
+  transactionId   String?  // gateway transaction id
+  payerNumber     String?  // bKash/Nagad number used to pay
+  payerReference  String?  // user-entered reference / trxID
+  paidAt          DateTime?
+  expiresAt       DateTime?
+  verifiedBy      String?  // admin who verified manual payment
+  notes           String?
+  metadata        String?  // JSON blob from gateway callback
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([userId])
+  @@index([status])
+  @@index([subscriptionId])
+  @@index([createdAt])
+}
+
+model PaymentGateway {
+  id            String   @id @default(cuid())
+  name          String   @unique // BKASH | NAGAD | SSLCOMMERZ | BANK | CASH | MANUAL
+  displayName   String
+  type          String   // MOBILE_BANKING | BANK | CARD | CASH | MANUAL
+  isActive      Boolean  @default(true)
+  config        String?  // JSON: {store_id, store_passwd, api_url, webhook_secret, ...}
+  merchantNumber String? // bKash/Nagad merchant number
+  instructions  String?  // payment instructions shown to customer
+  icon          String?
+  sortOrder     Int      @default(0)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  paymentOrders PaymentOrder[]
+}
+
+model Wallet {
+  id            String   @id @default(cuid())
+  userId        String   @unique
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  balance       Decimal  @default(0)
+  totalDeposited Decimal @default(0)
+  totalWithdrawn Decimal @default(0)
+  totalSpent    Decimal  @default(0)
+  currency      String   @default("BDT")
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  transactions  WalletTransaction[]
+}
+
+model WalletTransaction {
+  id            String   @id @default(cuid())
+  walletId      String
+  wallet        Wallet   @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  userId        String
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type          String   // DEPOSIT | WITHDRAW | PAYMENT | REFUND | ADJUSTMENT | TRANSFER_IN | TRANSFER_OUT
+  amount        Decimal  // signed: + for credit, - for debit
+  balanceAfter  Decimal
+  method        String?  // BKASH | NAGAD | BANK | CASH | MANUAL
+  reference     String?  // trxID or reference
+  description   String?
+  relatedOrderId String? // linked PaymentOrder if type=PAYMENT
+  status        String   @default("COMPLETED") // PENDING | COMPLETED | FAILED | REVERSED
+  createdBy     String?
+  createdAt     DateTime @default(now())
+
+  @@index([walletId])
+  @@index([userId])
+  @@index([type])
+  @@index([createdAt])
+}
+
+model PayoutAccount {
+  id            String   @id @default(cuid())
+  name          String
+  type          String   // BKASH | NAGAD | BANK | CASH
+  accountNumber String
+  accountHolder String?
+  bankName      String?
+  branch        String?
+  routingNumber String?
+  isActive      Boolean  @default(true)
+  isDefault     Boolean  @default(false)
+  notes         String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  payouts       PayoutRequest[]
+}
+
+model PayoutRequest {
+  id            String   @id @default(cuid())
+  payoutNumber   String   @unique
+  amount        Decimal
+  currency      String   @default("BDT")
+  type          String   // PAYOUT | TRANSFER | EXPENSE | SALARY
+  payoutAccountId String?
+  payoutAccount  PayoutAccount? @relation(fields: [payoutAccountId], references: [id], onDelete: SetNull)
+  recipientName String?
+  recipientAccount String?
+  recipientMethod String?
+  status        String   @default("PENDING") // PENDING | APPROVED | REJECTED | COMPLETED | FAILED
+  requestedBy   String?
+  requester     User?    @relation("PayoutRequester", fields: [requestedBy], references: [id], onDelete: SetNull)
+  approvedBy    String?
+  approver      User?    @relation("PayoutApprover", fields: [approvedBy], references: [id], onDelete: SetNull)
+  approvedAt    DateTime?
+  completedAt   DateTime?
+  notes         String?
+  reference     String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([status])
+  @@index([type])
+  @@index([createdAt])
+}
