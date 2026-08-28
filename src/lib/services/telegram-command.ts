@@ -13,6 +13,17 @@ import { toDecimal } from "@/lib/decimal";
 import { money, num } from "@/lib/api-client";
 import { hashPassword } from "@/lib/auth";
 import { AuditService } from "./audit";
+import { SupplierService } from "./supplier";
+import { PurchaseService } from "./purchase";
+import { WarehouseService, StockTransferService } from "./warehouse";
+import { CourierService } from "./courier";
+import { AutomationService } from "./automation";
+import { MessageTemplateService } from "./message-template";
+import { BillingService } from "./billing";
+import { DeliveryService } from "./delivery";
+import { ReturnService } from "./return";
+import { ConversationService } from "./conversation";
+import { SalesPipelineService } from "./sales-pipeline";
 
 const MANAGEABLE_ROLES = ["SUPER_ADMIN", "ADMIN", "MANAGER", "SALES", "INVENTORY", "ACCOUNTANT"] as const;
 
@@ -128,20 +139,31 @@ export const TelegramCommandService = {
       "/expenses": this.cmdExpenses, "/products": this.cmdProducts, "/stockcount": this.cmdStockCount,
       "/movements": this.cmdStockMovements, "/warehouses": this.cmdWarehouses, "/transfers": this.cmdTransfers,
       "/inbox": this.cmdInbox, "/notifications": this.cmdNotifications, "/pipeline": this.cmdPipeline,
-      "/users": this.cmdUsers,
+      "/users": this.cmdUsers, "/categories": this.cmdCategories, "/couriers": this.cmdCouriers,
+      "/automation": this.cmdAutomation, "/templates": this.cmdTemplates, "/wallet": this.cmdWallet,
+      "/auditlogs": this.cmdAuditLogs,
     };
 
-    // /adduser needs the raw "|"-separated text after the command, not the
-    // space-split args array every other command uses — handle it here.
-    if (command === "/adduser") {
+    // Commands that take raw "|"-separated text after the command (not the
+    // space-split args array every other command uses) — handled here.
+    const rawTextCommands: Record<string, (ctx: CommandContext, raw: string, lang: string) => Promise<void>> = {
+      "/adduser": this.cmdAddUser,
+      "/addcategory": this.cmdAddCategory,
+      "/addsupplier": this.cmdAddSupplier,
+      "/addwarehouse": this.cmdAddWarehouse,
+      "/addexpense": this.cmdAddExpense,
+      "/addproduct": this.cmdAddProduct,
+      "/transfer": this.cmdCreateTransfer,
+    };
+    if (rawTextCommands[command]) {
       try {
         const raw = text.slice(command.length).trim();
-        await this.cmdAddUser(ctx, raw, lang);
+        await rawTextCommands[command].call(this, ctx, raw, lang);
         await TelegramService.logAction({ groupId: ctx.group.id, userId: ctx.user?.id, telegramUserId: fromId, action: "COMMAND", command, result: "ok" });
-        return { ok: true, action: "adduser" };
+        return { ok: true, action: command.slice(1) };
       } catch (e) {
         await TelegramService.sendMessage(chatId, `❌ ${(e as Error).message}`);
-        return { ok: false, action: "adduser" };
+        return { ok: false, action: command.slice(1) };
       }
     }
 
@@ -370,6 +392,67 @@ export const TelegramCommandService = {
       case "user_resetpw_confirm": return this.confirmUserResetPw(ctx, params[0], messageId, lang);
       case "menu": return this.sendMenu(ctx, lang, messageId);
       case "help": return this.sendHelp(ctx, lang);
+
+      case "suppliers_page": return this.paginateSuppliers(ctx, Number(params[0]) || 1, messageId, lang);
+      case "supplier_view": return this.viewSupplier(ctx, params[0], messageId, lang);
+
+      case "purchases_page": return this.paginatePurchases(ctx, Number(params[0]) || 1, messageId, lang);
+      case "purchase_view": return this.viewPurchase(ctx, params[0], messageId, lang);
+      case "purchase_receive": return this.receivePurchasePrompt(ctx, params[0], messageId, lang);
+      case "purchase_receive_confirm": return this.confirmReceivePurchase(ctx, params[0], messageId, lang);
+
+      case "warehouses_page": return this.paginateWarehouses(ctx, Number(params[0]) || 1, messageId, lang);
+      case "warehouse_view": return this.viewWarehouse(ctx, params[0], messageId, lang);
+      case "warehouse_toggle": return this.confirmWarehouseTogglePrompt(ctx, params[0], messageId, lang);
+      case "warehouse_toggle_confirm": return this.confirmWarehouseToggle(ctx, params[0], params[1], messageId, lang);
+
+      case "transfers_page": return this.paginateTransfers(ctx, Number(params[0]) || 1, messageId, lang);
+      case "transfer_view": return this.viewTransfer(ctx, params[0], messageId, lang);
+
+      case "categories_page": return this.paginateCategories(ctx, Number(params[0]) || 1, messageId, lang);
+
+      case "expenses_page": return this.paginateExpenses(ctx, Number(params[0]) || 1, messageId, lang);
+
+      case "products_page": return this.paginateProducts(ctx, Number(params[0]) || 1, messageId, lang);
+      case "product_view": return this.viewProduct(ctx, params[0], messageId, lang);
+
+      case "movements_page": return this.paginateStockMovements(ctx, Number(params[0]) || 1, messageId, lang);
+
+      case "deliveries_page": return this.paginateDeliveries(ctx, Number(params[0]) || 1, messageId, lang);
+      case "delivery_view": return this.viewDelivery(ctx, params[0], messageId, lang);
+      case "delivery_status_menu": return this.deliveryStatusMenu(ctx, params[0], messageId, lang);
+      case "delivery_status_set": return this.confirmDeliveryStatusPrompt(ctx, params[0], params[1], messageId, lang);
+      case "delivery_status_confirm": return this.confirmDeliveryStatus(ctx, params[0], params[1], messageId, lang);
+
+      case "returns_page": return this.paginateReturns(ctx, Number(params[0]) || 1, messageId, lang);
+      case "return_view": return this.viewReturn(ctx, params[0], messageId, lang);
+
+      case "inbox_page": return this.paginateInbox(ctx, Number(params[0]) || 1, messageId, lang);
+      case "conversation_view": return this.viewConversation(ctx, params[0], messageId, lang);
+
+      case "notifications_page": return this.paginateNotifications(ctx, Number(params[0]) || 1, messageId, lang);
+      case "notif_mark_all": return this.confirmMarkAllNotificationsPrompt(ctx, messageId, lang);
+      case "notif_mark_all_confirm": return this.confirmMarkAllNotifications(ctx, messageId, lang);
+
+      case "pipeline_page": return this.paginatePipeline(ctx, Number(params[0]) || 1, messageId, lang);
+      case "pipeline_view": return this.viewPipelineEntry(ctx, params[0], messageId, lang);
+      case "pipeline_stage_menu": return this.pipelineStageMenu(ctx, params[0], messageId, lang);
+      case "pipeline_stage_set": return this.confirmPipelineStagePrompt(ctx, params[0], params[1], messageId, lang);
+      case "pipeline_stage_confirm": return this.confirmPipelineStage(ctx, params[0], params[1], messageId, lang);
+
+      case "couriers_page": return this.paginateCouriers(ctx, Number(params[0]) || 1, messageId, lang);
+      case "courier_toggle": return this.confirmCourierTogglePrompt(ctx, params[0], messageId, lang);
+      case "courier_toggle_confirm": return this.confirmCourierToggle(ctx, params[0], params[1], messageId, lang);
+
+      case "automation_page": return this.paginateAutomation(ctx, Number(params[0]) || 1, messageId, lang);
+      case "automation_toggle": return this.confirmAutomationTogglePrompt(ctx, params[0], messageId, lang);
+      case "automation_toggle_confirm": return this.confirmAutomationToggle(ctx, params[0], params[1], messageId, lang);
+
+      case "templates_page": return this.paginateTemplates(ctx, Number(params[0]) || 1, messageId, lang);
+      case "template_view": return this.viewTemplate(ctx, params[0], messageId, lang);
+
+      case "auditlogs_page": return this.paginateAuditLogs(ctx, Number(params[0]) || 1, messageId, lang);
+
       default:
         await TelegramService.sendMessage(ctx.chatId, this.t("unknownAction", lang));
     }
@@ -457,6 +540,29 @@ export const TelegramCommandService = {
     if (can("reports:read")) cmds.push("/cash — cash register summary");
     if (can("stock_counts:read")) cmds.push("/stockcount — stock counts");
     if (can("inventory:read")) cmds.push("/movements — stock movements");
+    if (can("deliveries:read")) cmds.push("/deliveries — deliveries (update status)");
+    if (can("returns:read")) cmds.push("/returns — returns");
+    if (can("purchases:read")) cmds.push("/purchases — purchases (mark received)");
+    if (can("suppliers:read")) cmds.push("/suppliers — suppliers");
+    if (can("suppliers:create")) cmds.push("/addsupplier Name | phone | email | address — add a supplier");
+    if (can("expenses:read")) cmds.push("/expenses — expenses");
+    if (can("expenses:create")) cmds.push("/addexpense Category | Amount | Method | Note — record an expense");
+    if (can("products:read")) cmds.push("/products — products");
+    if (can("products:create")) cmds.push("/addproduct Name | SKU | SellingPrice | PurchasePrice | Category — add a product");
+    if (can("categories:read")) cmds.push("/categories — product categories");
+    if (can("categories:create")) cmds.push("/addcategory Name | description — add a category");
+    if (can("warehouses:read")) cmds.push("/warehouses — warehouses (activate/deactivate)");
+    if (can("warehouses:create")) cmds.push("/addwarehouse Name | Code | Address — add a warehouse");
+    if (can("stock_transfers:read")) cmds.push("/transfers — stock transfers");
+    if (can("stock_transfers:create")) cmds.push("/transfer FROM_CODE | TO_CODE | SKU | QTY — move stock between warehouses");
+    if (can("conversations:read")) cmds.push("/inbox — open conversations");
+    if (can("notifications:read")) cmds.push("/notifications — unread notifications (mark all read)");
+    if (can("pipelines:read")) cmds.push("/pipeline — sales pipeline (move stage)");
+    if (can("deliveries:read")) cmds.push("/couriers — courier providers (activate/deactivate)");
+    if (can("automation:read")) cmds.push("/automation — automation rules (enable/disable)");
+    if (can("message_templates:read")) cmds.push("/templates — message templates");
+    if (can("billing:read")) cmds.push("/wallet — your billing & wallet summary");
+    if (can("audit_logs:read")) cmds.push("/auditlogs — recent audit log activity");
     const text = `<b>Z-CRM Bot Commands</b>\n\nRole: <b>${ctx.roleName}</b>\nGroup: ${ctx.group.chatTitle}\n\n${cmds.map((c) => "• " + c).join("\n")}`;
     await TelegramService.sendMessage(ctx.chatId, text);
   },
@@ -940,70 +1046,632 @@ export const TelegramCommandService = {
     await TelegramService.sendMessage(ctx.chatId, text);
   },
 
-  // Stub commands for remaining modules (show summary)
+  // --- Deliveries: list, view, change status ---
   async cmdDeliveries(ctx: CommandContext, _args: string[], lang: string) {
     if (!this.can(ctx, "deliveries:read")) return this.deny(ctx, lang);
-    const { DeliveryService } = await import("./delivery");
-    const d = await DeliveryService.dashboard();
-    const text = `<b>🚚 Deliveries</b>\nTotal: ${d.total} · Pending: ${d.pending} · Shipped: ${d.shipped} · Delivered: ${d.delivered}`;
-    await TelegramService.sendMessage(ctx.chatId, text);
+    await this.paginateDeliveries(ctx, 1, undefined, lang);
   },
+  async paginateDeliveries(ctx: CommandContext, page: number, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "deliveries:read")) return this.deny(ctx, lang);
+    const { items, total } = await DeliveryService.list({ page, limit: 5 });
+    if (!items.length) return TelegramService.sendMessage(ctx.chatId, this.t("noData", lang));
+    const totalPages = Math.ceil(total / 5) || 1;
+    const text = `<b>🚚 Deliveries</b> (${total})\n\n` + items.map((d: any) => `• ${d.order?.orderNumber ?? d.orderId}: ${d.status}`).join("\n") + `\n\n${this.t("page", lang).replace("{p}", String(page)).replace("{t}", String(totalPages))}`;
+    const rows: any[][] = items.map((d: any) => [{ text: `🚚 ${d.order?.orderNumber ?? d.orderId} (${d.status})`, callback_data: `delivery_view:${d.id}` }]);
+    rows.push(this.paginationRow(page, totalPages, "deliveries_page"));
+    await this.sendOrEdit(ctx, text, { inline_keyboard: rows }, messageId);
+  },
+  async viewDelivery(ctx: CommandContext, id: string, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "deliveries:read")) return this.deny(ctx, lang);
+    const d: any = await DeliveryService.get(id);
+    if (!d) return TelegramService.sendMessage(ctx.chatId, "Delivery not found");
+    const text = `<b>🚚 ${d.order?.orderNumber ?? d.orderId}</b>\nStatus: <b>${d.status}</b>\nCourier: ${d.courierName ?? d.courierProvider?.name ?? "—"}\nTracking: ${d.trackingNumber ?? "—"}\nRecipient: ${d.recipientName ?? "—"} · ${d.recipientPhone ?? "—"}\nCOD: ${money(d.codAmount)}`;
+    const rows: any[][] = [];
+    if (this.can(ctx, "deliveries:update")) rows.push([{ text: "🔄 Change Status", callback_data: `delivery_status_menu:${d.id}` }]);
+    rows.push([{ text: "⬅️ Back", callback_data: "deliveries_page:1" }]);
+    await this.sendOrEdit(ctx, text, { inline_keyboard: rows }, messageId);
+  },
+  async deliveryStatusMenu(ctx: CommandContext, id: string, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "deliveries:update")) return this.deny(ctx, lang);
+    const statuses = ["PENDING", "PACKED", "SHIPPED", "IN_TRANSIT", "DELIVERED", "FAILED", "RETURNED"];
+    const rows: any[][] = statuses.map((s) => [{ text: s, callback_data: `delivery_status_set:${id}|${s}` }]);
+    rows.push([{ text: "⬅️ Back", callback_data: `delivery_view:${id}` }]);
+    await this.sendOrEdit(ctx, "Select new delivery status:", { inline_keyboard: rows }, messageId);
+  },
+  async confirmDeliveryStatusPrompt(ctx: CommandContext, id: string, status: string, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "deliveries:update")) return this.deny(ctx, lang);
+    const kb = { inline_keyboard: [[
+      { text: this.t("yes", lang), callback_data: `delivery_status_confirm:${id}|${status}` },
+      { text: this.t("no", lang), callback_data: `delivery_view:${id}` },
+    ]] };
+    await this.sendOrEdit(ctx, `${this.t("confirm", lang)} Set delivery status to <b>${status}</b>?`, kb, messageId);
+  },
+  async confirmDeliveryStatus(ctx: CommandContext, id: string, status: string, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "deliveries:update")) return this.deny(ctx, lang);
+    try {
+      await DeliveryService.updateStatus(id, status, `Via Telegram by ${ctx.user?.firstName ?? ctx.telegramUserId}`);
+      await this.sendOrEdit(ctx, `${this.t("done", lang)} Delivery status set to <b>${status}</b>.`, { inline_keyboard: [[{ text: "⬅️ Back", callback_data: `delivery_view:${id}` }]] }, messageId);
+    } catch (e) {
+      await TelegramService.sendMessage(ctx.chatId, `❌ ${(e as Error).message}`);
+    }
+  },
+
+  // --- Returns: list, view ---
   async cmdReturns(ctx: CommandContext, _args: string[], lang: string) {
     if (!this.can(ctx, "returns:read")) return this.deny(ctx, lang);
-    const count = await db.return.count();
-    await TelegramService.sendMessage(ctx.chatId, `<b>↩️ Returns</b>\nTotal: ${count}`);
+    await this.paginateReturns(ctx, 1, undefined, lang);
   },
+  async paginateReturns(ctx: CommandContext, page: number, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "returns:read")) return this.deny(ctx, lang);
+    const [items, total] = await Promise.all([
+      db.return.findMany({ orderBy: { createdAt: "desc" }, skip: (page - 1) * 5, take: 5, include: { customer: { select: { name: true } }, order: { select: { orderNumber: true } } } }),
+      db.return.count(),
+    ]);
+    if (!items.length) return TelegramService.sendMessage(ctx.chatId, this.t("noData", lang));
+    const totalPages = Math.ceil(total / 5) || 1;
+    const text = `<b>↩️ Returns</b> (${total})\n\n` + items.map((r) => `• ${r.order.orderNumber} — ${r.customer.name}: ${r.status}`).join("\n") + `\n\n${this.t("page", lang).replace("{p}", String(page)).replace("{t}", String(totalPages))}`;
+    const rows: any[][] = items.map((r) => [{ text: `↩️ ${r.order.orderNumber} (${r.status})`, callback_data: `return_view:${r.id}` }]);
+    rows.push(this.paginationRow(page, totalPages, "returns_page"));
+    await this.sendOrEdit(ctx, text, { inline_keyboard: rows }, messageId);
+  },
+  async viewReturn(ctx: CommandContext, id: string, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "returns:read")) return this.deny(ctx, lang);
+    const r = await db.return.findUnique({ where: { id }, include: { customer: true, order: { select: { orderNumber: true } }, items: { include: { product: { select: { name: true } } } } } });
+    if (!r) return TelegramService.sendMessage(ctx.chatId, "Return not found");
+    const itemsText = r.items.map((i) => `  · ${i.product.name} × ${i.quantity}`).join("\n");
+    const text = `<b>↩️ Return — ${r.order.orderNumber}</b>\nCustomer: ${r.customer.name}\nType: ${r.type}\nStatus: <b>${r.status}</b>\nReason: ${r.reason ?? "—"}\nRefund: ${money(r.refundAmount)}\n\n${itemsText}`;
+    await this.sendOrEdit(ctx, text, { inline_keyboard: [[{ text: "⬅️ Back", callback_data: "returns_page:1" }]] }, messageId);
+  },
+
+  // --- Purchases: list, view, mark received ---
   async cmdPurchases(ctx: CommandContext, _args: string[], lang: string) {
     if (!this.can(ctx, "purchases:read")) return this.deny(ctx, lang);
-    const count = await db.purchase.count();
-    await TelegramService.sendMessage(ctx.chatId, `<b>🛒 Purchases</b>\nTotal: ${count}`);
+    await this.paginatePurchases(ctx, 1, undefined, lang);
   },
+  async paginatePurchases(ctx: CommandContext, page: number, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "purchases:read")) return this.deny(ctx, lang);
+    const [items, total] = await Promise.all([
+      db.purchase.findMany({ orderBy: { createdAt: "desc" }, skip: (page - 1) * 5, take: 5, include: { supplier: { select: { name: true } } } }),
+      db.purchase.count(),
+    ]);
+    if (!items.length) return TelegramService.sendMessage(ctx.chatId, this.t("noData", lang));
+    const totalPages = Math.ceil(total / 5) || 1;
+    const text = `<b>🛒 Purchases</b> (${total})\n\n` + items.map((p) => `• ${p.purchaseNumber} — ${p.supplier.name}: ${money(p.total)} (${p.status})`).join("\n") + `\n\n${this.t("page", lang).replace("{p}", String(page)).replace("{t}", String(totalPages))}`;
+    const rows: any[][] = items.map((p) => [{ text: `🛒 ${p.purchaseNumber} (${p.status})`, callback_data: `purchase_view:${p.id}` }]);
+    rows.push(this.paginationRow(page, totalPages, "purchases_page"));
+    await this.sendOrEdit(ctx, text, { inline_keyboard: rows }, messageId);
+  },
+  async viewPurchase(ctx: CommandContext, id: string, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "purchases:read")) return this.deny(ctx, lang);
+    const p = await db.purchase.findUnique({ where: { id }, include: { supplier: true, items: { include: { product: { select: { name: true } } } } } });
+    if (!p) return TelegramService.sendMessage(ctx.chatId, "Purchase not found");
+    const itemsText = p.items.map((i) => `  · ${i.product.name} × ${i.quantity}`).join("\n");
+    const text = `<b>🛒 ${p.purchaseNumber}</b>\nSupplier: ${p.supplier.name}\nStatus: <b>${p.status}</b>\nTotal: ${money(p.total)} · Paid: ${money(p.paidAmount)} · Due: ${money(p.dueAmount)}\n\n${itemsText}`;
+    const rows: any[][] = [];
+    if (p.status === "PENDING" && this.can(ctx, "purchases:update")) rows.push([{ text: "✅ Mark Received", callback_data: `purchase_receive:${p.id}` }]);
+    rows.push([{ text: "⬅️ Back", callback_data: "purchases_page:1" }]);
+    await this.sendOrEdit(ctx, text, { inline_keyboard: rows }, messageId);
+  },
+  async receivePurchasePrompt(ctx: CommandContext, id: string, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "purchases:update")) return this.deny(ctx, lang);
+    const kb = { inline_keyboard: [[
+      { text: this.t("yes", lang), callback_data: `purchase_receive_confirm:${id}` },
+      { text: this.t("no", lang), callback_data: `purchase_view:${id}` },
+    ]] };
+    await this.sendOrEdit(ctx, `${this.t("confirm", lang)} Mark this purchase as received? This will add the items to inventory.`, kb, messageId);
+  },
+  async confirmReceivePurchase(ctx: CommandContext, id: string, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "purchases:update")) return this.deny(ctx, lang);
+    try {
+      await PurchaseService.receive(id);
+      await this.sendOrEdit(ctx, `${this.t("done", lang)} Purchase received and stock updated.`, { inline_keyboard: [[{ text: "⬅️ Back", callback_data: `purchase_view:${id}` }]] }, messageId);
+    } catch (e) {
+      await TelegramService.sendMessage(ctx.chatId, `❌ ${(e as Error).message}`);
+    }
+  },
+
+  // --- Suppliers: list, view, add ---
   async cmdSuppliers(ctx: CommandContext, _args: string[], lang: string) {
     if (!this.can(ctx, "suppliers:read")) return this.deny(ctx, lang);
-    const count = await db.supplier.count();
-    await TelegramService.sendMessage(ctx.chatId, `<b>🏭 Suppliers</b>\nTotal: ${count}`);
+    await this.paginateSuppliers(ctx, 1, undefined, lang);
   },
-  async cmdExpenses(ctx: CommandContext, _args: string[], lang: string) {
-    if (!this.can(ctx, "expenses:read")) return this.deny(ctx, lang);
-    const agg = await db.expense.aggregate({ _sum: { amount: true }, _count: true });
-    await TelegramService.sendMessage(ctx.chatId, `<b>💸 Expenses</b>\nCount: ${agg._count} · Total: ${money((agg._sum.amount ?? 0).toFixed(2))}`);
+  async paginateSuppliers(ctx: CommandContext, page: number, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "suppliers:read")) return this.deny(ctx, lang);
+    const [items, total] = await Promise.all([
+      db.supplier.findMany({ orderBy: { name: "asc" }, skip: (page - 1) * 5, take: 5, include: { _count: { select: { purchases: true } } } }),
+      db.supplier.count(),
+    ]);
+    if (!items.length) return TelegramService.sendMessage(ctx.chatId, this.t("noData", lang));
+    const totalPages = Math.ceil(total / 5) || 1;
+    const text = `<b>🏭 Suppliers</b> (${total})\n\n` + items.map((s) => `• ${s.name}${s.phone ? " · " + s.phone : ""}`).join("\n") + `\n\n${this.t("page", lang).replace("{p}", String(page)).replace("{t}", String(totalPages))}`;
+    const rows: any[][] = items.map((s) => [{ text: `🏭 ${s.name}`, callback_data: `supplier_view:${s.id}` }]);
+    rows.push(this.paginationRow(page, totalPages, "suppliers_page"));
+    await this.sendOrEdit(ctx, text, { inline_keyboard: rows }, messageId);
   },
-  async cmdProducts(ctx: CommandContext, _args: string[], lang: string) {
-    if (!this.can(ctx, "products:read")) return this.deny(ctx, lang);
-    const count = await db.product.count();
-    await TelegramService.sendMessage(ctx.chatId, `<b>📦 Products</b>\nTotal: ${count}`);
+  async viewSupplier(ctx: CommandContext, id: string, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "suppliers:read")) return this.deny(ctx, lang);
+    const s = await db.supplier.findUnique({ where: { id }, include: { _count: { select: { purchases: true } } } });
+    if (!s) return TelegramService.sendMessage(ctx.chatId, "Supplier not found");
+    const text = `<b>🏭 ${s.name}</b>\n📞 ${s.phone ?? "—"}\n📧 ${s.email ?? "—"}\n🏢 ${s.company ?? "—"}\n📍 ${s.address ?? "—"}\nPurchases: ${s._count.purchases}`;
+    await this.sendOrEdit(ctx, text, { inline_keyboard: [[{ text: "⬅️ Back", callback_data: "suppliers_page:1" }]] }, messageId);
   },
-  async cmdStockMovements(ctx: CommandContext, _args: string[], lang: string) {
-    if (!this.can(ctx, "inventory:read")) return this.deny(ctx, lang);
-    const count = await db.stockMovement.count();
-    await TelegramService.sendMessage(ctx.chatId, `<b>🔄 Stock Movements</b>\nTotal: ${count}`);
+  // /addsupplier Name | phone | email | address(optional)
+  async cmdAddSupplier(ctx: CommandContext, raw: string, lang: string) {
+    if (!this.can(ctx, "suppliers:create")) return this.deny(ctx, lang);
+    const usage = "Usage:\n<code>/addsupplier Name | phone | email | address(optional)</code>";
+    if (!raw) return TelegramService.sendMessage(ctx.chatId, usage);
+    const [name, phone, email, address] = raw.split("|").map((p) => p.trim());
+    if (!name || name.length < 2) return TelegramService.sendMessage(ctx.chatId, "❌ Name must be at least 2 characters.");
+    const s = await db.supplier.create({ data: { name, phone: phone || undefined, email: email || undefined, address: address || undefined } });
+    await AuditService.log({ userId: ctx.user?.id ?? null, action: "SUPPLIER_CREATE", entity: "Supplier", entityId: s.id, changes: { name, via: "telegram" } });
+    await TelegramService.sendMessage(ctx.chatId, `✅ Supplier created: <b>${s.name}</b>`);
   },
+
+  // --- Warehouses: list, view, toggle, add ---
   async cmdWarehouses(ctx: CommandContext, _args: string[], lang: string) {
     if (!this.can(ctx, "warehouses:read")) return this.deny(ctx, lang);
-    const count = await db.warehouse.count();
-    await TelegramService.sendMessage(ctx.chatId, `<b>🏪 Warehouses</b>\nTotal: ${count}`);
+    await this.paginateWarehouses(ctx, 1, undefined, lang);
   },
+  async paginateWarehouses(ctx: CommandContext, page: number, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "warehouses:read")) return this.deny(ctx, lang);
+    const all = await WarehouseService.list();
+    const total = all.length;
+    const items = all.slice((page - 1) * 5, page * 5);
+    if (!items.length) return TelegramService.sendMessage(ctx.chatId, this.t("noData", lang));
+    const totalPages = Math.ceil(total / 5) || 1;
+    const text = `<b>🏪 Warehouses</b> (${total})\n\n` + items.map((w: any) => `• ${w.name} (${w.code})${w.isDefault ? " · default" : ""}${w.isActive ? "" : " · inactive"}`).join("\n") + `\n\n${this.t("page", lang).replace("{p}", String(page)).replace("{t}", String(totalPages))}`;
+    const rows: any[][] = items.map((w: any) => [{ text: `${w.isActive ? "🟢" : "⚪"} ${w.name}`, callback_data: `warehouse_view:${w.id}` }]);
+    rows.push(this.paginationRow(page, totalPages, "warehouses_page"));
+    await this.sendOrEdit(ctx, text, { inline_keyboard: rows }, messageId);
+  },
+  async viewWarehouse(ctx: CommandContext, id: string, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "warehouses:read")) return this.deny(ctx, lang);
+    const w = await db.warehouse.findUnique({ where: { id }, include: { _count: { select: { warehouseStock: true } } } });
+    if (!w) return TelegramService.sendMessage(ctx.chatId, "Warehouse not found");
+    const text = `<b>🏪 ${w.name}</b>\nCode: ${w.code}\nAddress: ${w.address ?? "—"}\nStatus: ${w.isActive ? "🟢 Active" : "⚪ Inactive"}${w.isDefault ? " (default)" : ""}\nSKUs stocked: ${w._count.warehouseStock}`;
+    const rows: any[][] = [];
+    if (this.can(ctx, "warehouses:update") && !w.isDefault) rows.push([{ text: w.isActive ? "⛔ Deactivate" : "✅ Activate", callback_data: `warehouse_toggle:${w.id}` }]);
+    rows.push([{ text: "⬅️ Back", callback_data: "warehouses_page:1" }]);
+    await this.sendOrEdit(ctx, text, { inline_keyboard: rows }, messageId);
+  },
+  async confirmWarehouseTogglePrompt(ctx: CommandContext, id: string, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "warehouses:update")) return this.deny(ctx, lang);
+    const w = await db.warehouse.findUnique({ where: { id } });
+    if (!w) return;
+    const next = w.isActive ? "inactive" : "active";
+    const kb = { inline_keyboard: [[
+      { text: this.t("yes", lang), callback_data: `warehouse_toggle_confirm:${id}|${next}` },
+      { text: this.t("no", lang), callback_data: `warehouse_view:${id}` },
+    ]] };
+    await this.sendOrEdit(ctx, `${this.t("confirm", lang)} ${w.isActive ? "Deactivate" : "Activate"} <b>${w.name}</b>?`, kb, messageId);
+  },
+  async confirmWarehouseToggle(ctx: CommandContext, id: string, next: string, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "warehouses:update")) return this.deny(ctx, lang);
+    try {
+      const w = await WarehouseService.update(id, { isActive: next === "active" });
+      await this.sendOrEdit(ctx, `${this.t("done", lang)} <b>${w.name}</b> is now ${w.isActive ? "🟢 active" : "⚪ inactive"}.`, { inline_keyboard: [[{ text: "⬅️ Back", callback_data: `warehouse_view:${id}` }]] }, messageId);
+    } catch (e) {
+      await TelegramService.sendMessage(ctx.chatId, `❌ ${(e as Error).message}`);
+    }
+  },
+  // /addwarehouse Name | Code | Address(optional)
+  async cmdAddWarehouse(ctx: CommandContext, raw: string, lang: string) {
+    if (!this.can(ctx, "warehouses:create")) return this.deny(ctx, lang);
+    const usage = "Usage:\n<code>/addwarehouse Name | Code | Address(optional)</code>";
+    if (!raw) return TelegramService.sendMessage(ctx.chatId, usage);
+    const [name, code, address] = raw.split("|").map((p) => p.trim());
+    if (!name || !code) return TelegramService.sendMessage(ctx.chatId, usage);
+    const w = await WarehouseService.create({ name, code: code.toUpperCase(), address: address || undefined });
+    await TelegramService.sendMessage(ctx.chatId, `✅ Warehouse created: <b>${w.name}</b> (${w.code})`);
+  },
+
+  // --- Stock Transfers: list, view, create ---
   async cmdTransfers(ctx: CommandContext, _args: string[], lang: string) {
     if (!this.can(ctx, "stock_transfers:read")) return this.deny(ctx, lang);
-    const count = await db.stockTransfer.count();
-    await TelegramService.sendMessage(ctx.chatId, `<b>🔀 Stock Transfers</b>\nTotal: ${count}`);
+    await this.paginateTransfers(ctx, 1, undefined, lang);
   },
+  async paginateTransfers(ctx: CommandContext, page: number, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "stock_transfers:read")) return this.deny(ctx, lang);
+    const { items, total } = await StockTransferService.list({ page, limit: 5 });
+    if (!items.length) return TelegramService.sendMessage(ctx.chatId, this.t("noData", lang));
+    const totalPages = Math.ceil(total / 5) || 1;
+    const text = `<b>🔀 Stock Transfers</b> (${total})\n\n` + items.map((t: any) => `• ${t.transferNumber}: ${t.fromWarehouse.name} → ${t.toWarehouse.name} (${t.status})`).join("\n") + `\n\n${this.t("page", lang).replace("{p}", String(page)).replace("{t}", String(totalPages))}`;
+    const rows: any[][] = items.map((t: any) => [{ text: `🔀 ${t.transferNumber}`, callback_data: `transfer_view:${t.id}` }]);
+    rows.push(this.paginationRow(page, totalPages, "transfers_page"));
+    await this.sendOrEdit(ctx, text, { inline_keyboard: rows }, messageId);
+  },
+  async viewTransfer(ctx: CommandContext, id: string, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "stock_transfers:read")) return this.deny(ctx, lang);
+    const t = await db.stockTransfer.findUnique({ where: { id }, include: { fromWarehouse: true, toWarehouse: true, items: { include: { product: { select: { name: true } } } } } });
+    if (!t) return TelegramService.sendMessage(ctx.chatId, "Transfer not found");
+    const itemsText = t.items.map((i) => `  · ${i.product.name} × ${i.quantity}`).join("\n");
+    const text = `<b>🔀 ${t.transferNumber}</b>\n${t.fromWarehouse.name} → ${t.toWarehouse.name}\nStatus: <b>${t.status}</b>\n\n${itemsText}`;
+    await this.sendOrEdit(ctx, text, { inline_keyboard: [[{ text: "⬅️ Back", callback_data: "transfers_page:1" }]] }, messageId);
+  },
+  // /transfer FROM_CODE | TO_CODE | PRODUCT_SKU | QTY
+  async cmdCreateTransfer(ctx: CommandContext, raw: string, lang: string) {
+    if (!this.can(ctx, "stock_transfers:create")) return this.deny(ctx, lang);
+    const usage = "Usage:\n<code>/transfer FROM_CODE | TO_CODE | PRODUCT_SKU | QTY</code>";
+    if (!raw) return TelegramService.sendMessage(ctx.chatId, usage);
+    const [fromCode, toCode, sku, qtyStr] = raw.split("|").map((p) => p.trim());
+    if (!fromCode || !toCode || !sku || !qtyStr) return TelegramService.sendMessage(ctx.chatId, usage);
+    const [fromWh, toWh, product] = await Promise.all([
+      db.warehouse.findUnique({ where: { code: fromCode.toUpperCase() } }),
+      db.warehouse.findUnique({ where: { code: toCode.toUpperCase() } }),
+      db.product.findUnique({ where: { sku } }),
+    ]);
+    if (!fromWh) return TelegramService.sendMessage(ctx.chatId, `❌ No warehouse with code ${fromCode}`);
+    if (!toWh) return TelegramService.sendMessage(ctx.chatId, `❌ No warehouse with code ${toCode}`);
+    if (!product) return TelegramService.sendMessage(ctx.chatId, `❌ No product with SKU ${sku}`);
+    const qty = Number(qtyStr);
+    if (!Number.isFinite(qty) || qty <= 0) return TelegramService.sendMessage(ctx.chatId, "❌ Quantity must be a positive number.");
+    const t = await StockTransferService.create({ fromWarehouseId: fromWh.id, toWarehouseId: toWh.id, notes: `Via Telegram by ${ctx.user?.firstName ?? ctx.telegramUserId}`, items: [{ productId: product.id, quantity: qty }] });
+    await TelegramService.sendMessage(ctx.chatId, `✅ Transfer <b>${t.transferNumber}</b> created: ${qty} × ${product.name} from ${fromWh.name} to ${toWh.name}.`);
+  },
+
+  // --- Categories: list, add ---
+  async cmdCategories(ctx: CommandContext, _args: string[], lang: string) {
+    if (!this.can(ctx, "categories:read")) return this.deny(ctx, lang);
+    await this.paginateCategories(ctx, 1, undefined, lang);
+  },
+  async paginateCategories(ctx: CommandContext, page: number, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "categories:read")) return this.deny(ctx, lang);
+    const [items, total] = await Promise.all([
+      db.category.findMany({ orderBy: [{ sortOrder: "asc" }, { name: "asc" }], skip: (page - 1) * 8, take: 8, include: { _count: { select: { products: true } } } }),
+      db.category.count(),
+    ]);
+    if (!items.length) return TelegramService.sendMessage(ctx.chatId, this.t("noData", lang));
+    const totalPages = Math.ceil(total / 8) || 1;
+    const text = `<b>🗂️ Categories</b> (${total})\n\n` + items.map((c) => `• ${c.name}: ${c._count.products} products${c.status === "ACTIVE" ? "" : " (inactive)"}`).join("\n") + `\n\n${this.t("page", lang).replace("{p}", String(page)).replace("{t}", String(totalPages))}\n\nAdd one: <code>/addcategory Name</code>`;
+    await this.sendOrEdit(ctx, text, { inline_keyboard: [this.paginationRow(page, totalPages, "categories_page")] }, messageId);
+  },
+  // /addcategory Name | description(optional)
+  async cmdAddCategory(ctx: CommandContext, raw: string, lang: string) {
+    if (!this.can(ctx, "categories:create")) return this.deny(ctx, lang);
+    const usage = "Usage:\n<code>/addcategory Name | description(optional)</code>";
+    if (!raw) return TelegramService.sendMessage(ctx.chatId, usage);
+    const [name, description] = raw.split("|").map((p) => p.trim());
+    if (!name || name.length < 2) return TelegramService.sendMessage(ctx.chatId, "❌ Name must be at least 2 characters.");
+    const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+    const existing = await db.category.findUnique({ where: { slug } });
+    if (existing) return TelegramService.sendMessage(ctx.chatId, "❌ A category with this name already exists.");
+    const c = await db.category.create({ data: { name, slug, description: description || undefined } });
+    await AuditService.log({ userId: ctx.user?.id ?? null, action: "CATEGORY_CREATE", entity: "Category", entityId: c.id, changes: { name, via: "telegram" } });
+    await TelegramService.sendMessage(ctx.chatId, `✅ Category created: <b>${c.name}</b>`);
+  },
+
+  // --- Expenses: list, add ---
+  async cmdExpenses(ctx: CommandContext, _args: string[], lang: string) {
+    if (!this.can(ctx, "expenses:read")) return this.deny(ctx, lang);
+    await this.paginateExpenses(ctx, 1, undefined, lang);
+  },
+  async paginateExpenses(ctx: CommandContext, page: number, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "expenses:read")) return this.deny(ctx, lang);
+    const [items, total, agg] = await Promise.all([
+      db.expense.findMany({ orderBy: { expenseDate: "desc" }, skip: (page - 1) * 5, take: 5, include: { category: { select: { name: true } } } }),
+      db.expense.count(),
+      db.expense.aggregate({ _sum: { amount: true } }),
+    ]);
+    if (!items.length) return TelegramService.sendMessage(ctx.chatId, this.t("noData", lang));
+    const totalPages = Math.ceil(total / 5) || 1;
+    const text = `<b>💸 Expenses</b> (${total} · total ${money((agg._sum.amount ?? 0).toFixed(2))})\n\n` + items.map((e) => `• ${e.category.name}: ${money(e.amount)} — ${e.description ?? e.paymentMethod}`).join("\n") + `\n\n${this.t("page", lang).replace("{p}", String(page)).replace("{t}", String(totalPages))}\n\nAdd one: <code>/addexpense Category | Amount | Method | Note(optional)</code>`;
+    await this.sendOrEdit(ctx, text, { inline_keyboard: [this.paginationRow(page, totalPages, "expenses_page")] }, messageId);
+  },
+  // /addexpense Category | Amount | Method | Note(optional)
+  async cmdAddExpense(ctx: CommandContext, raw: string, lang: string) {
+    if (!this.can(ctx, "expenses:create")) return this.deny(ctx, lang);
+    const usage = "Usage:\n<code>/addexpense Category | Amount | Method | Note(optional)</code>\n\nMethods: CASH, BKASH, NAGAD, BANK, CARD, OTHER";
+    if (!raw) return TelegramService.sendMessage(ctx.chatId, usage);
+    const [categoryName, amountStr, methodRaw, note] = raw.split("|").map((p) => p.trim());
+    const amount = Number(amountStr);
+    const method = methodRaw?.toUpperCase();
+    if (!categoryName || !Number.isFinite(amount) || amount <= 0 || !method) return TelegramService.sendMessage(ctx.chatId, usage);
+    let category = await db.expenseCategory.findUnique({ where: { name: categoryName } });
+    if (!category) category = await db.expenseCategory.create({ data: { name: categoryName } });
+    const e = await db.expense.create({ data: { categoryId: category.id, amount, paymentMethod: method, description: note || undefined, createdBy: ctx.user?.id } });
+    await AuditService.log({ userId: ctx.user?.id ?? null, action: "EXPENSE_CREATE", entity: "Expense", entityId: e.id, changes: { amount, category: category.name, via: "telegram" } });
+    await TelegramService.sendMessage(ctx.chatId, `✅ Expense recorded: <b>${money(amount)}</b> — ${category.name}`);
+  },
+
+  // --- Products: list, view, add ---
+  async cmdProducts(ctx: CommandContext, _args: string[], lang: string) {
+    if (!this.can(ctx, "products:read")) return this.deny(ctx, lang);
+    await this.paginateProducts(ctx, 1, undefined, lang);
+  },
+  async paginateProducts(ctx: CommandContext, page: number, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "products:read")) return this.deny(ctx, lang);
+    const [items, total] = await Promise.all([
+      db.product.findMany({ orderBy: { name: "asc" }, skip: (page - 1) * 5, take: 5, include: { inventory: { select: { quantity: true } } } }),
+      db.product.count(),
+    ]);
+    if (!items.length) return TelegramService.sendMessage(ctx.chatId, this.t("noData", lang));
+    const totalPages = Math.ceil(total / 5) || 1;
+    const text = `<b>📦 Products</b> (${total})\n\n` + items.map((p) => `• ${p.name} (${p.sku}): ${money(p.sellingPrice)}`).join("\n") + `\n\n${this.t("page", lang).replace("{p}", String(page)).replace("{t}", String(totalPages))}`;
+    const rows: any[][] = items.map((p) => [{ text: `📦 ${p.name}`, callback_data: `product_view:${p.id}` }]);
+    rows.push(this.paginationRow(page, totalPages, "products_page"));
+    await this.sendOrEdit(ctx, text, { inline_keyboard: rows }, messageId);
+  },
+  async viewProduct(ctx: CommandContext, id: string, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "products:read")) return this.deny(ctx, lang);
+    const p = await db.product.findUnique({ where: { id }, include: { category: { select: { name: true } }, inventory: { select: { quantity: true } } } });
+    if (!p) return TelegramService.sendMessage(ctx.chatId, "Product not found");
+    const text = `<b>📦 ${p.name}</b>\nSKU: ${p.sku}\nCategory: ${p.category?.name ?? "—"}\nSelling: ${money(p.sellingPrice)} · Purchase: ${money(p.purchasePrice)}\nStock: ${p.inventory?.quantity ?? 0}\nStatus: ${p.status}`;
+    await this.sendOrEdit(ctx, text, { inline_keyboard: [[{ text: "⬅️ Back", callback_data: "products_page:1" }]] }, messageId);
+  },
+  // /addproduct Name | SKU | SellingPrice | PurchasePrice(optional) | Category(optional)
+  async cmdAddProduct(ctx: CommandContext, raw: string, lang: string) {
+    if (!this.can(ctx, "products:create")) return this.deny(ctx, lang);
+    const usage = "Usage:\n<code>/addproduct Name | SKU | SellingPrice | PurchasePrice(optional) | Category(optional)</code>";
+    if (!raw) return TelegramService.sendMessage(ctx.chatId, usage);
+    const [name, sku, sellingStr, purchaseStr, categoryName] = raw.split("|").map((p) => p.trim());
+    const sellingPrice = Number(sellingStr);
+    if (!name || !sku || !Number.isFinite(sellingPrice)) return TelegramService.sendMessage(ctx.chatId, usage);
+    const existing = await db.product.findUnique({ where: { sku } });
+    if (existing) return TelegramService.sendMessage(ctx.chatId, "❌ A product with this SKU already exists.");
+    let categoryId: string | undefined;
+    if (categoryName) {
+      const cat = await db.category.findFirst({ where: { name: categoryName } });
+      categoryId = cat?.id;
+    }
+    const slug = sku.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+    const p = await db.product.create({ data: { name, sku, slug, sellingPrice, purchasePrice: Number(purchaseStr) || 0, categoryId, inventory: { create: { quantity: 0 } } } });
+    await AuditService.log({ userId: ctx.user?.id ?? null, action: "PRODUCT_CREATE", entity: "Product", entityId: p.id, changes: { name, sku, via: "telegram" } });
+    await TelegramService.sendMessage(ctx.chatId, `✅ Product created: <b>${p.name}</b> (${p.sku})\nUse /inventory to add stock via a stock adjustment.`);
+  },
+
+  // --- Stock Movements: read-only ledger ---
+  async cmdStockMovements(ctx: CommandContext, _args: string[], lang: string) {
+    if (!this.can(ctx, "inventory:read")) return this.deny(ctx, lang);
+    await this.paginateStockMovements(ctx, 1, undefined, lang);
+  },
+  async paginateStockMovements(ctx: CommandContext, page: number, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "inventory:read")) return this.deny(ctx, lang);
+    const [items, total] = await Promise.all([
+      db.stockMovement.findMany({ orderBy: { createdAt: "desc" }, skip: (page - 1) * 8, take: 8, include: { product: { select: { name: true } } } }),
+      db.stockMovement.count(),
+    ]);
+    if (!items.length) return TelegramService.sendMessage(ctx.chatId, this.t("noData", lang));
+    const totalPages = Math.ceil(total / 8) || 1;
+    const text = `<b>🔄 Stock Movements</b> (${total})\n\n` + items.map((m) => `• ${m.product.name}: ${m.type} ${Number(m.quantityChange) > 0 ? "+" : ""}${m.quantityChange}`).join("\n") + `\n\n${this.t("page", lang).replace("{p}", String(page)).replace("{t}", String(totalPages))}`;
+    await this.sendOrEdit(ctx, text, { inline_keyboard: [this.paginationRow(page, totalPages, "movements_page")] }, messageId);
+  },
+
+  // --- Inbox: list conversations ---
   async cmdInbox(ctx: CommandContext, _args: string[], lang: string) {
     if (!this.can(ctx, "conversations:read")) return this.deny(ctx, lang);
-    const count = await db.conversation.count({ where: { status: "OPEN" } });
-    await TelegramService.sendMessage(ctx.chatId, `<b>📥 Inbox</b>\nOpen conversations: ${count}`);
+    await this.paginateInbox(ctx, 1, undefined, lang);
   },
+  async paginateInbox(ctx: CommandContext, page: number, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "conversations:read")) return this.deny(ctx, lang);
+    const { items, total } = await ConversationService.list({ page, limit: 5, status: "OPEN" });
+    if (!items.length) return TelegramService.sendMessage(ctx.chatId, this.t("noData", lang));
+    const totalPages = Math.ceil(total / 5) || 1;
+    const text = `<b>📥 Inbox — Open</b> (${total})\n\n` + items.map((c: any) => `• ${c.contactName ?? c.customer?.name ?? "Unknown"} (${c.provider})${c.unreadCount ? ` · ${c.unreadCount} unread` : ""}`).join("\n") + `\n\n${this.t("page", lang).replace("{p}", String(page)).replace("{t}", String(totalPages))}`;
+    const rows: any[][] = items.map((c: any) => [{ text: `💬 ${c.contactName ?? c.customer?.name ?? "Unknown"}`, callback_data: `conversation_view:${c.id}` }]);
+    rows.push(this.paginationRow(page, totalPages, "inbox_page"));
+    await this.sendOrEdit(ctx, text, { inline_keyboard: rows }, messageId);
+  },
+  async viewConversation(ctx: CommandContext, id: string, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "conversations:read")) return this.deny(ctx, lang);
+    const c: any = await ConversationService.get(id);
+    if (!c) return TelegramService.sendMessage(ctx.chatId, "Conversation not found");
+    const text = `<b>💬 ${c.contactName ?? c.customer?.name ?? "Unknown"}</b>\nChannel: ${c.provider}\nStatus: ${c.status}\nLast message: ${c.lastMessagePreview ?? "—"}`;
+    await this.sendOrEdit(ctx, text, { inline_keyboard: [[{ text: "⬅️ Back", callback_data: "inbox_page:1" }]] }, messageId);
+  },
+
+  // --- Notifications: list, mark all read ---
   async cmdNotifications(ctx: CommandContext, _args: string[], lang: string) {
     if (!this.can(ctx, "notifications:read")) return this.deny(ctx, lang);
-    const count = await db.notification.count({ where: { isRead: false } });
-    await TelegramService.sendMessage(ctx.chatId, `<b>🔔 Notifications</b>\nUnread: ${count}`);
+    await this.paginateNotifications(ctx, 1, undefined, lang);
   },
+  async paginateNotifications(ctx: CommandContext, page: number, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "notifications:read")) return this.deny(ctx, lang);
+    const { items, total } = await NotificationService.listForUser(ctx.user?.id, { page, limit: 8, unreadOnly: true });
+    const rows: any[][] = [];
+    if (items.length) rows.push([{ text: "✅ Mark all as read", callback_data: "notif_mark_all" }]);
+    if (!items.length) {
+      await this.sendOrEdit(ctx, `<b>🔔 Notifications</b>\n\nNo unread notifications.`, { inline_keyboard: rows }, messageId);
+      return;
+    }
+    const totalPages = Math.ceil(total / 8) || 1;
+    const text = `<b>🔔 Notifications</b> (${total} unread)\n\n` + items.map((n: any) => `• ${n.title}: ${n.message}`).join("\n") + `\n\n${this.t("page", lang).replace("{p}", String(page)).replace("{t}", String(totalPages))}`;
+    rows.push(this.paginationRow(page, totalPages, "notifications_page"));
+    await this.sendOrEdit(ctx, text, { inline_keyboard: rows }, messageId);
+  },
+  async confirmMarkAllNotificationsPrompt(ctx: CommandContext, messageId: number | undefined, lang: string) {
+    const kb = { inline_keyboard: [[
+      { text: this.t("yes", lang), callback_data: "notif_mark_all_confirm" },
+      { text: this.t("no", lang), callback_data: "notifications_page:1" },
+    ]] };
+    await this.sendOrEdit(ctx, `${this.t("confirm", lang)} Mark all your notifications as read?`, kb, messageId);
+  },
+  async confirmMarkAllNotifications(ctx: CommandContext, messageId: number | undefined, lang: string) {
+    await NotificationService.markAllRead(ctx.user?.id);
+    await this.sendOrEdit(ctx, `${this.t("done", lang)} All notifications marked as read.`, undefined, messageId);
+  },
+
+  // --- Sales Pipeline: list, view, move stage ---
   async cmdPipeline(ctx: CommandContext, _args: string[], lang: string) {
     if (!this.can(ctx, "pipelines:read")) return this.deny(ctx, lang);
-    const { SalesPipelineService } = await import("./sales-pipeline");
     const p = await SalesPipelineService.pipeline();
     const text = `<b>📊 Sales Pipeline</b>\n` + Object.entries(p).map(([stage, s]) => `• ${stage}: ${(s as any).count} (${money((s as any).value)})`).join("\n");
+    await TelegramService.sendMessage(ctx.chatId, text, { inline_keyboard: [[{ text: "📋 View entries", callback_data: "pipeline_page:1" }]] });
+  },
+  async paginatePipeline(ctx: CommandContext, page: number, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "pipelines:read")) return this.deny(ctx, lang);
+    const { items, total } = await SalesPipelineService.list({ page, limit: 5 });
+    if (!items.length) return TelegramService.sendMessage(ctx.chatId, this.t("noData", lang));
+    const totalPages = Math.ceil(total / 5) || 1;
+    const text = `<b>📊 Pipeline Entries</b> (${total})\n\n` + items.map((e: any) => `• ${e.customer?.name ?? "—"}: ${e.stage} (${money(e.value)})`).join("\n") + `\n\n${this.t("page", lang).replace("{p}", String(page)).replace("{t}", String(totalPages))}`;
+    const rows: any[][] = items.map((e: any) => [{ text: `📊 ${e.customer?.name ?? "—"} (${e.stage})`, callback_data: `pipeline_view:${e.id}` }]);
+    rows.push(this.paginationRow(page, totalPages, "pipeline_page"));
+    await this.sendOrEdit(ctx, text, { inline_keyboard: rows }, messageId);
+  },
+  async viewPipelineEntry(ctx: CommandContext, id: string, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "pipelines:read")) return this.deny(ctx, lang);
+    const e = await db.salesPipelineEntry.findUnique({ where: { id }, include: { customer: { select: { name: true } } } });
+    if (!e) return TelegramService.sendMessage(ctx.chatId, "Entry not found");
+    const text = `<b>📊 ${e.customer.name}</b>\nStage: <b>${e.stage}</b>\nValue: ${money(e.value)}\nNotes: ${e.notes ?? "—"}`;
+    const rows: any[][] = [];
+    if (this.can(ctx, "pipelines:update")) rows.push([{ text: "🔀 Move Stage", callback_data: `pipeline_stage_menu:${e.id}` }]);
+    rows.push([{ text: "⬅️ Back", callback_data: "pipeline_page:1" }]);
+    await this.sendOrEdit(ctx, text, { inline_keyboard: rows }, messageId);
+  },
+  async pipelineStageMenu(ctx: CommandContext, id: string, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "pipelines:update")) return this.deny(ctx, lang);
+    const stages = ["NEW", "CONTACTED", "QUALIFIED", "NEGOTIATION", "ORDER_CREATED", "WON", "LOST"];
+    const rows: any[][] = stages.map((s) => [{ text: s, callback_data: `pipeline_stage_set:${id}|${s}` }]);
+    rows.push([{ text: "⬅️ Back", callback_data: `pipeline_view:${id}` }]);
+    await this.sendOrEdit(ctx, "Select new stage:", { inline_keyboard: rows }, messageId);
+  },
+  async confirmPipelineStagePrompt(ctx: CommandContext, id: string, stage: string, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "pipelines:update")) return this.deny(ctx, lang);
+    const kb = { inline_keyboard: [[
+      { text: this.t("yes", lang), callback_data: `pipeline_stage_confirm:${id}|${stage}` },
+      { text: this.t("no", lang), callback_data: `pipeline_view:${id}` },
+    ]] };
+    await this.sendOrEdit(ctx, `${this.t("confirm", lang)} Move to stage <b>${stage}</b>?`, kb, messageId);
+  },
+  async confirmPipelineStage(ctx: CommandContext, id: string, stage: string, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "pipelines:update")) return this.deny(ctx, lang);
+    try {
+      await SalesPipelineService.updateStage(id, stage);
+      await this.sendOrEdit(ctx, `${this.t("done", lang)} Stage set to <b>${stage}</b>.`, { inline_keyboard: [[{ text: "⬅️ Back", callback_data: `pipeline_view:${id}` }]] }, messageId);
+    } catch (e) {
+      await TelegramService.sendMessage(ctx.chatId, `❌ ${(e as Error).message}`);
+    }
+  },
+
+  // --- Couriers: list, toggle active ---
+  async cmdCouriers(ctx: CommandContext, _args: string[], lang: string) {
+    if (!this.can(ctx, "deliveries:read")) return this.deny(ctx, lang);
+    await this.paginateCouriers(ctx, 1, undefined, lang);
+  },
+  async paginateCouriers(ctx: CommandContext, page: number, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "deliveries:read")) return this.deny(ctx, lang);
+    const all = await CourierService.listProviders();
+    const total = all.length;
+    const items = all.slice((page - 1) * 8, page * 8);
+    if (!items.length) return TelegramService.sendMessage(ctx.chatId, this.t("noData", lang));
+    const totalPages = Math.ceil(total / 8) || 1;
+    const text = `<b>🚴 Couriers</b> (${total})\n\n` + items.map((c: any) => `• ${c.name}${c.isActive ? " 🟢" : " ⚪"}${c.isMock ? " (mock)" : ""}`).join("\n") + `\n\n${this.t("page", lang).replace("{p}", String(page)).replace("{t}", String(totalPages))}`;
+    const rows: any[][] = [];
+    if (this.can(ctx, "deliveries:update")) rows.push(...items.map((c: any) => [{ text: `${c.isActive ? "⛔ Deactivate" : "✅ Activate"} ${c.name}`, callback_data: `courier_toggle:${c.id}` }]));
+    rows.push(this.paginationRow(page, totalPages, "couriers_page"));
+    await this.sendOrEdit(ctx, text, { inline_keyboard: rows }, messageId);
+  },
+  async confirmCourierTogglePrompt(ctx: CommandContext, id: string, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "deliveries:update")) return this.deny(ctx, lang);
+    const c = await db.courierProvider.findUnique({ where: { id } });
+    if (!c) return;
+    const next = c.isActive ? "inactive" : "active";
+    const kb = { inline_keyboard: [[
+      { text: this.t("yes", lang), callback_data: `courier_toggle_confirm:${id}|${next}` },
+      { text: this.t("no", lang), callback_data: "couriers_page:1" },
+    ]] };
+    await this.sendOrEdit(ctx, `${this.t("confirm", lang)} ${c.isActive ? "Deactivate" : "Activate"} <b>${c.name}</b>?`, kb, messageId);
+  },
+  async confirmCourierToggle(ctx: CommandContext, id: string, next: string, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "deliveries:update")) return this.deny(ctx, lang);
+    try {
+      const c = await CourierService.updateProvider(id, { isActive: next === "active" });
+      await this.sendOrEdit(ctx, `${this.t("done", lang)} <b>${c.name}</b> is now ${c.isActive ? "🟢 active" : "⚪ inactive"}.`, { inline_keyboard: [[{ text: "⬅️ Back", callback_data: "couriers_page:1" }]] }, messageId);
+    } catch (e) {
+      await TelegramService.sendMessage(ctx.chatId, `❌ ${(e as Error).message}`);
+    }
+  },
+
+  // --- Automation: list rules, toggle active ---
+  async cmdAutomation(ctx: CommandContext, _args: string[], lang: string) {
+    if (!this.can(ctx, "automation:read")) return this.deny(ctx, lang);
+    await this.paginateAutomation(ctx, 1, undefined, lang);
+  },
+  async paginateAutomation(ctx: CommandContext, page: number, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "automation:read")) return this.deny(ctx, lang);
+    const all = await AutomationService.listRules();
+    const total = all.length;
+    const items = all.slice((page - 1) * 8, page * 8);
+    if (!items.length) return TelegramService.sendMessage(ctx.chatId, this.t("noData", lang));
+    const totalPages = Math.ceil(total / 8) || 1;
+    const text = `<b>⚙️ Automation Rules</b> (${total})\n\n` + items.map((r: any) => `• ${r.name}: ${r.event} → ${r.action}${r.isActive ? " 🟢" : " ⚪"}`).join("\n") + `\n\n${this.t("page", lang).replace("{p}", String(page)).replace("{t}", String(totalPages))}`;
+    const rows: any[][] = [];
+    if (this.can(ctx, "automation:update")) rows.push(...items.map((r: any) => [{ text: `${r.isActive ? "⛔ Disable" : "✅ Enable"} ${r.name}`, callback_data: `automation_toggle:${r.id}` }]));
+    rows.push(this.paginationRow(page, totalPages, "automation_page"));
+    await this.sendOrEdit(ctx, text, { inline_keyboard: rows }, messageId);
+  },
+  async confirmAutomationTogglePrompt(ctx: CommandContext, id: string, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "automation:update")) return this.deny(ctx, lang);
+    const r = await db.automationRule.findUnique({ where: { id } });
+    if (!r) return;
+    const next = r.isActive ? "inactive" : "active";
+    const kb = { inline_keyboard: [[
+      { text: this.t("yes", lang), callback_data: `automation_toggle_confirm:${id}|${next}` },
+      { text: this.t("no", lang), callback_data: "automation_page:1" },
+    ]] };
+    await this.sendOrEdit(ctx, `${this.t("confirm", lang)} ${r.isActive ? "Disable" : "Enable"} rule <b>${r.name}</b>?`, kb, messageId);
+  },
+  async confirmAutomationToggle(ctx: CommandContext, id: string, next: string, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "automation:update")) return this.deny(ctx, lang);
+    try {
+      const r = await AutomationService.updateRule(id, { isActive: next === "active" });
+      await this.sendOrEdit(ctx, `${this.t("done", lang)} <b>${r.name}</b> is now ${r.isActive ? "🟢 enabled" : "⚪ disabled"}.`, { inline_keyboard: [[{ text: "⬅️ Back", callback_data: "automation_page:1" }]] }, messageId);
+    } catch (e) {
+      await TelegramService.sendMessage(ctx.chatId, `❌ ${(e as Error).message}`);
+    }
+  },
+
+  // --- Message Templates: list, view ---
+  async cmdTemplates(ctx: CommandContext, _args: string[], lang: string) {
+    if (!this.can(ctx, "message_templates:read")) return this.deny(ctx, lang);
+    await this.paginateTemplates(ctx, 1, undefined, lang);
+  },
+  async paginateTemplates(ctx: CommandContext, page: number, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "message_templates:read")) return this.deny(ctx, lang);
+    const all = await MessageTemplateService.list({});
+    const total = all.length;
+    const items = all.slice((page - 1) * 8, page * 8);
+    if (!items.length) return TelegramService.sendMessage(ctx.chatId, this.t("noData", lang));
+    const totalPages = Math.ceil(total / 8) || 1;
+    const text = `<b>📨 Message Templates</b> (${total})\n\n` + items.map((t: any) => `• ${t.name} (${t.channel})${t.isApproved ? " ✅" : ""}`).join("\n") + `\n\n${this.t("page", lang).replace("{p}", String(page)).replace("{t}", String(totalPages))}`;
+    const rows: any[][] = items.map((t: any) => [{ text: `📨 ${t.name}`, callback_data: `template_view:${t.id}` }]);
+    rows.push(this.paginationRow(page, totalPages, "templates_page"));
+    await this.sendOrEdit(ctx, text, { inline_keyboard: rows }, messageId);
+  },
+  async viewTemplate(ctx: CommandContext, id: string, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "message_templates:read")) return this.deny(ctx, lang);
+    const t = await db.messageTemplate.findUnique({ where: { id } });
+    if (!t) return TelegramService.sendMessage(ctx.chatId, "Template not found");
+    const text = `<b>📨 ${t.name}</b>\nChannel: ${t.channel} · Category: ${t.category}\nApproved: ${t.isApproved ? "✅" : "❌"}\n\n${t.body}`;
+    await this.sendOrEdit(ctx, text, { inline_keyboard: [[{ text: "⬅️ Back", callback_data: "templates_page:1" }]] }, messageId);
+  },
+
+  // --- Billing & Wallet: read-only summary ---
+  async cmdWallet(ctx: CommandContext, _args: string[], lang: string) {
+    if (!this.can(ctx, "billing:read")) return this.deny(ctx, lang);
+    if (!ctx.user?.id) return TelegramService.sendMessage(ctx.chatId, "Link your account first with /link in a private chat.");
+    const [wallet, sub] = await Promise.all([
+      BillingService.getWalletBalance(ctx.user.id),
+      BillingService.getCurrentSubscription(ctx.user.id),
+    ]);
+    const text = `<b>💳 Billing & Wallet</b>\n\nWallet balance: ${money(wallet.balance)}\nDeposited: ${money(wallet.totalDeposited)} · Spent: ${money(wallet.totalSpent)}\n\nSubscription: ${sub ? `${sub.plan} (${sub.status})` : "None"}`;
     await TelegramService.sendMessage(ctx.chatId, text);
+  },
+
+  // --- Audit Logs: read-only recent activity ---
+  async cmdAuditLogs(ctx: CommandContext, _args: string[], lang: string) {
+    if (!this.can(ctx, "audit_logs:read")) return this.deny(ctx, lang);
+    await this.paginateAuditLogs(ctx, 1, undefined, lang);
+  },
+  async paginateAuditLogs(ctx: CommandContext, page: number, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "audit_logs:read")) return this.deny(ctx, lang);
+    const [items, total] = await Promise.all([
+      db.auditLog.findMany({ orderBy: { createdAt: "desc" }, skip: (page - 1) * 8, take: 8, include: { user: { select: { name: true } } } }),
+      db.auditLog.count(),
+    ]);
+    if (!items.length) return TelegramService.sendMessage(ctx.chatId, this.t("noData", lang));
+    const totalPages = Math.ceil(total / 8) || 1;
+    const text = `<b>🕵️ Audit Logs</b> (${total})\n\n` + items.map((l) => `• ${l.action} — ${l.entity} · ${l.user?.name ?? "system"} · ${new Date(l.createdAt).toLocaleString()}`).join("\n") + `\n\n${this.t("page", lang).replace("{p}", String(page)).replace("{t}", String(totalPages))}`;
+    await this.sendOrEdit(ctx, text, { inline_keyboard: [this.paginationRow(page, totalPages, "auditlogs_page")] }, messageId);
   },
 
   // --- helpers ---
