@@ -3,11 +3,12 @@ import { Prisma } from "@prisma/client";
 import { TelegramService } from "./telegram";
 import { OrderService } from "./order";
 import { PaymentService } from "./payment";
+import { TelegramSessionStore, type OrderDraft } from "./telegram-session";
+import { ProfitabilityService } from "./profitability";
+import { CustomerDueService } from "./customer-due";
 import { InventoryService } from "./inventory";
 import { StockReconciliationService } from "./stock-reconciliation";
 import { AccountingService } from "./accounting";
-import { ProfitabilityService } from "./profitability";
-import { CustomerDueService } from "./customer-due";
 import { CashService } from "./cash";
 import { LeadService } from "./lead";
 import { NotificationService } from "./notification";
@@ -122,6 +123,20 @@ export const TelegramCommandService = {
     const lang = ctx.user?.language ?? "en";
     const [cmd, ...args] = text.split(" ");
     const command = cmd.toLowerCase();
+
+    // ── Multi-step flow text input interception ──
+    // If the user has an active order draft session, capture their text
+    // input for the current step (customer phone, product search, quantity,
+    // shipping amount, etc.) instead of treating it as an unknown command.
+    // The session is keyed by (telegramUserId, chatId) so user A's draft
+    // can never be affected by user B's input.
+    if (!command.startsWith("/") && !text.startsWith("/")) {
+      const handled = await this.handleOrderDraftTextInput(ctx, text, lang);
+      if (handled) {
+        await TelegramService.logAction({ groupId: ctx.group.id, userId: ctx.user?.id, telegramUserId: fromId, action: "COMMAND", command: "draft_input", result: "ok" });
+        return { ok: true, action: "draft_input" };
+      }
+    }
 
     if (command === "/start") {
       await this.sendStart(ctx, lang);
@@ -495,6 +510,24 @@ export const TelegramCommandService = {
       case "reports_menu": return this.reportsMenu(ctx, messageId, lang);
       case "reports_view": return this.viewReport(ctx, params[0] || "profit-loss", messageId, lang);
 
+      // ── NEW: interactive /createorder multi-step flow ──
+      case "od_search_customer": return this.odSearchCustomer(ctx, messageId, lang);
+      case "od_select_customer": return this.odSelectCustomer(ctx, params[0], messageId, lang);
+      case "od_new_customer": return this.odNewCustomerPrompt(ctx, messageId, lang);
+      case "od_search_product": return this.odSearchProduct(ctx, messageId, lang);
+      case "od_select_product": return this.odSelectProduct(ctx, params[0], messageId, lang);
+      case "od_select_variation": return this.odSelectVariation(ctx, params[0], messageId, lang);
+      case "od_set_qty": return this.odSetQty(ctx, params[0], messageId, lang);
+      case "od_add_more": return this.odAddMore(ctx, params[0], messageId, lang);
+      case "od_set_shipping": return this.odSetShipping(ctx, messageId, lang);
+      case "od_set_discount": return this.odSetDiscount(ctx, messageId, lang);
+      case "od_set_payment_method": return this.odSetPaymentMethod(ctx, params[0], messageId, lang);
+      case "od_set_payment_amount": return this.odSetPaymentAmount(ctx, messageId, lang);
+      case "od_show_summary": return this.odShowSummary(ctx, messageId, lang);
+      case "od_confirm": return this.odConfirm(ctx, messageId, lang);
+      case "od_cancel": return this.odCancel(ctx, messageId, lang);
+      case "od_remove_item": return this.odRemoveItem(ctx, params[0], messageId, lang);
+
       default:
         await TelegramService.sendMessage(ctx.chatId, this.t("unknownAction", lang));
     }
@@ -658,10 +691,46 @@ export const TelegramCommandService = {
 
   async viewOrder(ctx: CommandContext, orderId: string, messageId: number | undefined, lang: string) {
     if (!this.can(ctx, "orders:read")) return this.deny(ctx, lang);
-    const o = await db.order.findUnique({ where: { id: orderId }, include: { customer: true, channel: true, items: true, payments: true } });
+    const o = await db.order.findUnique({ where: { id: orderId }, include: { customer: true, channel: true, items: true, payments: true, delivery: true, expenses: true, refunds: true } });
     if (!o) return TelegramService.sendMessage(ctx.chatId, "Order not found");
-    const profit = toDecimal(o.total).minus(o.items.reduce((s, it) => s.add(toDecimal(it.unitCost).times(toDecimal(it.quantity))), new (await import("@prisma/client")).Prisma.Decimal(0)));
-    const text = `<b>${o.orderNumber}</b>\n👤 ${o.customer.name} · ${o.customer.phone}\n📦 ${o.items.length} items\n💵 Total: ${money(o.total.toFixed(2))}\n✅ Paid: ${money(o.paidAmount.toFixed(2))}\n📊 Status: ${o.status}\n💰 Profit: ${money(profit.toFixed(2))}\n🔗 Channel: ${o.channel.name}`;
+
+    // Use ProfitabilityService for the canonical financial breakdown —
+    // NOT inline arithmetic that could drift from the dashboard.
+    const snap = await ProfitabilityService.computeOrderSnapshot(orderId);
+    const margin = snap.totalSales.gt(0) ? snap.netProfit.dividedBy(snap.totalSales).times(100) : new Prisma.Decimal(0);
+    const due = toDecimal(o.total).minus(toDecimal(o.paidAmount));
+
+    const itemsText = o.items.map((it) => `• ${it.productName} (${it.sku}) × ${it.quantity} @ ${money(Number(it.unitPrice).toFixed(2))} = ${money(Number(it.total).toFixed(2))}`).join("\n");
+
+    const text =
+      `<b>📦 ${o.orderNumber}</b>\n\n` +
+      `👤 <b>Customer:</b> ${o.customer.name}\n` +
+      `📞 <b>Phone:</b> ${o.customer.phone}\n` +
+      `🔗 <b>Channel:</b> ${o.channel.name}\n` +
+      `📅 <b>Date:</b> ${o.createdAt.toISOString().slice(0, 10)}\n` +
+      `📊 <b>Status:</b> ${o.status} | ${o.paymentStatus}\n\n` +
+      `<b>Items:</b>\n${itemsText}\n\n` +
+      `<b>Financial Breakdown:</b>\n` +
+      `Subtotal: ${money(snap.totalSales.minus(snap.tax).minus(snap.shippingIncome).minus(snap.otherIncome).minus(snap.otherCost).toFixed(2))}\n` +
+      `Discount: -${money(Number(o.discount).toFixed(2))}\n` +
+      `Tax: ${money(snap.tax.toFixed(2))}\n` +
+      `Shipping: ${money(snap.shippingIncome.toFixed(2))}\n` +
+      `${snap.paymentFee.gt(0) ? `Payment Fee: ${money(snap.paymentFee.toFixed(2))}\n` : ""}` +
+      `${snap.platformFee.gt(0) ? `Platform Fee: ${money(snap.platformFee.toFixed(2))}\n` : ""}` +
+      `${snap.packagingCost.gt(0) ? `Packaging: ${money(snap.packagingCost.toFixed(2))}\n` : ""}` +
+      `${snap.deliveryCost.gt(0) ? `Delivery Cost: ${money(snap.deliveryCost.toFixed(2))}\n` : ""}` +
+      `${snap.orderExpenses.gt(0) ? `Other Expenses: ${money(snap.orderExpenses.toFixed(2))}\n` : ""}` +
+      `─────────────\n` +
+      `<b>Total: ${money(Number(o.total).toFixed(2))}</b>\n` +
+      `Paid: ${money(Number(o.paidAmount).toFixed(2))}\n` +
+      `Due: ${money(due.toFixed(2))}\n\n` +
+      `<b>Profitability:</b>\n` +
+      `COGS: ${money(snap.cogsTotal.toFixed(2))}\n` +
+      `Gross Profit: ${money(snap.grossProfit.toFixed(2))}\n` +
+      `Net Profit: ${money(snap.netProfit.toFixed(2))}\n` +
+      `Margin: ${margin.toFixed(1)}%\n` +
+      (o.delivery ? `\n<b>Delivery:</b> ${o.delivery.courierName ?? "—"} | ${o.delivery.trackingNumber ?? "—"} | ${o.delivery.status}` : "");
+
     const rows: any[][] = [];
     if (this.can(ctx, "orders:update")) {
       rows.push([{ text: "✅ Confirm", callback_data: `order_status_confirm:${o.id}|CONFIRMED` }, { text: "🚚 Ship", callback_data: `order_status_confirm:${o.id}|SHIPPED` }]);
@@ -750,13 +819,40 @@ export const TelegramCommandService = {
 
   async viewCustomer(ctx: CommandContext, customerId: string, messageId: number | undefined, lang: string) {
     if (!this.can(ctx, "customers:read")) return this.deny(ctx, lang);
-    const c = await db.customer.findUnique({ where: { id: customerId }, include: { _count: { select: { orders: true } } } });
-    if (!c) return TelegramService.sendMessage(ctx.chatId, "Customer not found");
-    const orderAgg = await db.order.aggregate({ where: { customerId: c.id, status: { not: "CANCELLED" } }, _sum: { total: true, paidAmount: true } });
-    const due = toDecimal(orderAgg._sum.total ?? 0).minus(toDecimal(orderAgg._sum.paidAmount ?? 0));
-    const text = `<b>${c.name}</b>\n📞 ${c.phone}\n📧 ${c.email ?? "—"}\n🏙️ ${c.city ?? "—"}\n📦 Orders: ${c._count.orders}\n💵 Total: ${money((orderAgg._sum.total ?? 0).toFixed(2))}\n💸 Due: ${money(due.toFixed(2))}`;
-    const rows: any[][] = [[{ text: "⬅️ Back", callback_data: "customers_page:1" }]];
-    await this.sendOrEdit(ctx, text, { inline_keyboard: rows }, messageId);
+    // Use CustomerDueService.computeDue for the canonical due figure —
+    // NOT inline arithmetic that could drift from the dashboard.
+    try {
+      const due = await CustomerDueService.computeDue(customerId);
+      const c = await db.customer.findUnique({ where: { id: customerId }, include: { _count: { select: { orders: true } } } });
+      if (!c) return TelegramService.sendMessage(ctx.chatId, "Customer not found");
+      const completedOrders = await db.order.count({ where: { customerId: c.id, status: "COMPLETED" } });
+      const cancelledOrders = await db.order.count({ where: { customerId: c.id, status: "CANCELLED" } });
+      const returnedOrders = await db.order.count({ where: { customerId: c.id, status: "RETURNED" } });
+      const lastOrder = await db.order.findFirst({ where: { customerId: c.id }, orderBy: { createdAt: "desc" }, select: { orderNumber: true, total: true, createdAt: true, status: true } });
+      const text =
+        `<b>👤 ${c.name}</b>\n` +
+        `📞 ${c.phone}\n` +
+        `📧 ${c.email ?? "—"}\n` +
+        `🏙️ ${c.city ?? "—"}\n` +
+        `📍 ${c.address ?? "—"}\n\n` +
+        `<b>Orders:</b> ${due.orderCount} total (${completedOrders} completed, ${cancelledOrders} cancelled, ${returnedOrders} returned)\n\n` +
+        `<b>Financials:</b>\n` +
+        `Total Sales: ${money(due.totalSales)}\n` +
+        `Total Paid: ${money(due.totalPaid)}\n` +
+        `Refunds: ${money(due.totalRefund)}\n` +
+        `Advance: ${money(due.advance)}\n` +
+        `<b>Outstanding Due: ${money(due.totalDue)}</b>\n\n` +
+        (due.lastPayment ? `Last Payment: ${money(due.lastPayment.amount)} (${due.lastPayment.method}) on ${due.lastPayment.date.toISOString().slice(0, 10)}\n` : "") +
+        (lastOrder ? `\nLast Order: ${lastOrder.orderNumber} — ${money(Number(lastOrder.total).toFixed(2))} (${lastOrder.status})` : "");
+      const rows: any[][] = [];
+      if (this.can(ctx, "orders:create")) {
+        rows.push([{ text: "🛒 Create Order", callback_data: "od_search_customer" }]);
+      }
+      rows.push([{ text: "⬅️ Back", callback_data: "customers_page:1" }]);
+      await this.sendOrEdit(ctx, text, { inline_keyboard: rows }, messageId);
+    } catch (e) {
+      await TelegramService.sendMessage(ctx.chatId, `❌ ${(e as Error).message}`);
+    }
   },
 
   // --- Users (full CRUD via bot) ---
@@ -1548,17 +1644,554 @@ export const TelegramCommandService = {
   },
 
   // ────────────────────────────────────────────────────────────────
+  // NEW: Interactive multi-step /createorder flow.
+  //
+  // Uses TelegramSessionStore for per-user conversation state.
+  // Flow: customer → product search → product select → variation →
+  //       qty → add more? → shipping → discount → payment method →
+  //       payment amount → summary → confirm → create.
+  //
+  // SECURITY: session is keyed by (telegramUserId, chatId). Callback
+  // handlers re-resolve the session from the sender's identity — never
+  // from callback_data. So user B tapping user A's button can't mutate
+  // user A's draft.
+  // ────────────────────────────────────────────────────────────────
+  async startInteractiveOrder(ctx: CommandContext, lang: string) {
+    const draft = TelegramSessionStore.startOrderDraft(ctx.telegramUserId, ctx.chatId);
+    await TelegramService.sendMessage(
+      ctx.chatId,
+      `🛒 <b>Interactive Order Creation</b>\n\nStep 1: Select Customer\n\nSend a phone number to search, or use the buttons below.`,
+      {
+        inline_keyboard: [
+          [{ text: "🔍 Recent Customers", callback_data: "od_search_customer" }],
+          [{ text: "➕ New Customer", callback_data: "od_new_customer" }],
+          [{ text: "❌ Cancel", callback_data: "od_cancel" }],
+        ],
+      },
+    );
+    void draft;
+  },
+
+  // Text input handler — captures user input for the current draft step.
+  async handleOrderDraftTextInput(ctx: CommandContext, text: string, lang: string): Promise<boolean> {
+    const draft = TelegramSessionStore.getOrderDraft(ctx.telegramUserId, ctx.chatId);
+    if (!draft) return false; // no active session → let the message fall through
+
+    // Re-check permission on every interaction (session alone doesn't authorise).
+    if (!this.can(ctx, "orders:create")) {
+      TelegramSessionStore.clearOrderDraft(ctx.telegramUserId, ctx.chatId);
+      await TelegramService.sendMessage(ctx.chatId, "⛔ Permission denied. Order draft cancelled.");
+      return true;
+    }
+
+    const step = draft.step;
+    try {
+      if (step === "customer") {
+        // If in new-customer mode, parse "Name | Phone". Otherwise search.
+        if (draft.lastSearchQuery === "__new_customer__") {
+          return await this.odHandleNewCustomerInput(ctx, text, lang, draft);
+        }
+        // User typed a phone number or name — search customers.
+        return await this.odHandleCustomerSearch(ctx, text, lang, draft);
+      }
+      if (step === "product_search") {
+        // User typed a product name or SKU — search products.
+        return await this.odHandleProductSearch(ctx, text, lang, draft);
+      }
+      if (step === "quantity") {
+        // User typed a quantity for the pending product.
+        return await this.odHandleQuantityInput(ctx, text, lang, draft);
+      }
+      if (step === "shipping") {
+        return await this.odHandleShippingInput(ctx, text, lang, draft);
+      }
+      if (step === "discount") {
+        return await this.odHandleDiscountInput(ctx, text, lang, draft);
+      }
+      if (step === "payment_amount") {
+        return await this.odHandlePaymentAmountInput(ctx, text, lang, draft);
+      }
+      // Unknown step — ignore (let the message fall through).
+      return false;
+    } catch (e) {
+      await TelegramService.sendMessage(ctx.chatId, `❌ ${(e as Error).message}\n\nSend /createorder to restart.`);
+      TelegramSessionStore.clearOrderDraft(ctx.telegramUserId, ctx.chatId);
+      return true;
+    }
+  },
+
+  // ── Customer search ──
+  async odSearchCustomer(ctx: CommandContext, messageId: number | undefined, lang: string) {
+    const draft = TelegramSessionStore.getOrderDraft(ctx.telegramUserId, ctx.chatId);
+    if (!draft) return this.sessionExpired(ctx, messageId);
+    draft.step = "customer";
+    TelegramSessionStore.saveOrderDraft(draft);
+    await this.sendOrEdit(
+      ctx,
+      `🛒 <b>Step 1: Select Customer</b>\n\nSend a phone number or name to search, or browse recent customers below.`,
+      {
+        inline_keyboard: [
+          [{ text: "🔍 Recent Customers", callback_data: "od_search_customer" }],
+          [{ text: "➕ New Customer", callback_data: "od_new_customer" }],
+          [{ text: "❌ Cancel", callback_data: "od_cancel" }],
+        ],
+      },
+      messageId,
+    );
+    // Show recent customers
+    const customers = await db.customer.findMany({ orderBy: { createdAt: "desc" }, take: 8 });
+    if (customers.length > 0) {
+      const rows = customers.map((c) => [{ text: `👤 ${c.name} · ${c.phone}`, callback_data: `od_select_customer:${c.id}` }]);
+      rows.push([{ text: "❌ Cancel", callback_data: "od_cancel" }]);
+      await TelegramService.sendMessage(ctx.chatId, "Recent customers:", { inline_keyboard: rows });
+    }
+  },
+
+  async odHandleCustomerSearch(ctx: CommandContext, text: string, lang: string, draft: OrderDraft): Promise<boolean> {
+    // Search by phone or name
+    const customers = await db.customer.findMany({
+      where: { OR: [{ phone: { contains: text } }, { name: { contains: text, mode: "insensitive" } }] },
+      take: 8,
+    });
+    if (customers.length === 0) {
+      await TelegramService.sendMessage(ctx.chatId, `No customers found for "${text}".\n\nSend another search, or /createorder to start over.`);
+      return true;
+    }
+    const rows = customers.map((c) => [{ text: `👤 ${c.name} · ${c.phone}`, callback_data: `od_select_customer:${c.id}` }]);
+    rows.push([{ text: "❌ Cancel", callback_data: "od_cancel" }]);
+    await TelegramService.sendMessage(ctx.chatId, `Found ${customers.length} customer(s):`, { inline_keyboard: rows });
+    return true;
+  },
+
+  async odSelectCustomer(ctx: CommandContext, customerId: string, messageId: number | undefined, lang: string) {
+    const draft = TelegramSessionStore.getOrderDraft(ctx.telegramUserId, ctx.chatId);
+    if (!draft) return this.sessionExpired(ctx, messageId);
+    const customer = await db.customer.findUnique({ where: { id: customerId } });
+    if (!customer) return TelegramService.sendMessage(ctx.chatId, "❌ Customer not found.");
+    draft.customerId = customer.id;
+    draft.customerName = customer.name;
+    draft.customerPhone = customer.phone;
+    draft.step = "product_search";
+    TelegramSessionStore.saveOrderDraft(draft);
+    await this.sendOrEdit(
+      ctx,
+      `✅ Customer: <b>${customer.name}</b> (${customer.phone})\n\n🛒 <b>Step 2: Select Product</b>\n\nSend a product name or SKU to search.`,
+      {
+        inline_keyboard: [
+          [{ text: "🔍 Recent Products", callback_data: "od_search_product" }],
+          [{ text: "❌ Cancel", callback_data: "od_cancel" }],
+        ],
+      },
+      messageId,
+    );
+    // Show recent products
+    const products = await db.product.findMany({ where: { status: "ACTIVE" }, orderBy: { createdAt: "desc" }, take: 8, select: { id: true, name: true, sku: true, sellingPrice: true } });
+    if (products.length > 0) {
+      const rows = products.map((p) => [{ text: `📦 ${p.name} (${p.sku}) — ${money(p.sellingPrice.toFixed(2))}`, callback_data: `od_select_product:${p.id}` }]);
+      rows.push([{ text: "❌ Cancel", callback_data: "od_cancel" }]);
+      await TelegramService.sendMessage(ctx.chatId, "Recent products:", { inline_keyboard: rows });
+    }
+  },
+
+  async odNewCustomerPrompt(ctx: CommandContext, messageId: number | undefined, lang: string) {
+    const draft = TelegramSessionStore.getOrderDraft(ctx.telegramUserId, ctx.chatId);
+    if (!draft) return this.sessionExpired(ctx, messageId);
+    draft.step = "customer";
+    draft.lastSearchQuery = "__new_customer__";
+    TelegramSessionStore.saveOrderDraft(draft);
+    await this.sendOrEdit(
+      ctx,
+      `➕ <b>New Customer</b>\n\nSend customer details in this format:\n\n<code>Name | Phone</code>\n\nExample: <code>John Doe | 01712345678</code>`,
+      { inline_keyboard: [[{ text: "⬅️ Back", callback_data: "od_search_customer" }], [{ text: "❌ Cancel", callback_data: "od_cancel" }]] },
+      messageId,
+    );
+  },
+
+  async odHandleNewCustomerInput(ctx: CommandContext, text: string, lang: string, draft: OrderDraft): Promise<boolean> {
+    const [name, phone] = text.split("|").map((s) => s.trim());
+    if (!name || !phone) {
+      await TelegramService.sendMessage(ctx.chatId, "❌ Format: Name | Phone\n\nExample: John Doe | 01712345678");
+      return true;
+    }
+    // Check if phone already exists
+    const existing = await db.customer.findUnique({ where: { phone } });
+    if (existing) {
+      draft.customerId = existing.id;
+      draft.customerName = existing.name;
+      draft.customerPhone = existing.phone;
+    } else {
+      const created = await db.customer.create({ data: { name, phone } });
+      draft.customerId = created.id;
+      draft.customerName = created.name;
+      draft.customerPhone = created.phone;
+    }
+    draft.step = "product_search";
+    draft.lastSearchQuery = undefined;
+    TelegramSessionStore.saveOrderDraft(draft);
+    await TelegramService.sendMessage(
+      ctx.chatId,
+      `✅ Customer: <b>${draft.customerName}</b> (${draft.customerPhone})\n\n🛒 <b>Step 2: Select Product</b>\n\nSend a product name or SKU to search.`,
+    );
+    return true;
+  },
+
+  // ── Product search ──
+  async odSearchProduct(ctx: CommandContext, messageId: number | undefined, lang: string) {
+    const draft = TelegramSessionStore.getOrderDraft(ctx.telegramUserId, ctx.chatId);
+    if (!draft) return this.sessionExpired(ctx, messageId);
+    draft.step = "product_search";
+    TelegramSessionStore.saveOrderDraft(draft);
+    const products = await db.product.findMany({ where: { status: "ACTIVE" }, orderBy: { createdAt: "desc" }, take: 10, select: { id: true, name: true, sku: true, sellingPrice: true } });
+    if (products.length === 0) {
+      return this.sendOrEdit(ctx, "No active products found.", { inline_keyboard: [[{ text: "❌ Cancel", callback_data: "od_cancel" }]] }, messageId);
+    }
+    const rows = products.map((p) => [{ text: `📦 ${p.name} (${p.sku}) — ${money(p.sellingPrice.toFixed(2))}`, callback_data: `od_select_product:${p.id}` }]);
+    rows.push([{ text: "❌ Cancel", callback_data: "od_cancel" }]);
+    await this.sendOrEdit(ctx, `🛒 <b>Select Product</b> (${products.length} recent)\n\nOr send a product name/SKU to search.`, { inline_keyboard: rows }, messageId);
+  },
+
+  async odHandleProductSearch(ctx: CommandContext, text: string, lang: string, draft: OrderDraft): Promise<boolean> {
+    const products = await db.product.findMany({
+      where: { AND: [{ status: "ACTIVE" }, { OR: [{ sku: { contains: text, mode: "insensitive" } }, { name: { contains: text, mode: "insensitive" } }] }] },
+      take: 10,
+      select: { id: true, name: true, sku: true, sellingPrice: true, purchasePrice: true, weightedAverageCost: true },
+    });
+    if (products.length === 0) {
+      await TelegramService.sendMessage(ctx.chatId, `No products found for "${text}".\n\nSend another search term.`);
+      return true;
+    }
+    const rows = products.map((p) => [{ text: `📦 ${p.name} (${p.sku}) — ${money(p.sellingPrice.toFixed(2))}`, callback_data: `od_select_product:${p.id}` }]);
+    rows.push([{ text: "❌ Cancel", callback_data: "od_cancel" }]);
+    await TelegramService.sendMessage(ctx.chatId, `Found ${products.length} product(s):`, { inline_keyboard: rows });
+    return true;
+  },
+
+  async odSelectProduct(ctx: CommandContext, productId: string, messageId: number | undefined, lang: string) {
+    const draft = TelegramSessionStore.getOrderDraft(ctx.telegramUserId, ctx.chatId);
+    if (!draft) return this.sessionExpired(ctx, messageId);
+    const product = await db.product.findUnique({ where: { id: productId }, include: { productVariants: { where: { isActive: true } } } });
+    if (!product) return TelegramService.sendMessage(ctx.chatId, "❌ Product not found.");
+
+    // Check for variants — if the product has variants, show variation selection.
+    if (product.productVariants.length > 0) {
+      draft.pendingProduct = {
+        productId: product.id,
+        productName: product.name,
+        sku: product.sku,
+        unitPrice: product.sellingPrice,
+        unitCost: product.weightedAverageCost || product.purchasePrice,
+        isVariable: true,
+      };
+      draft.step = "variation";
+      TelegramSessionStore.saveOrderDraft(draft);
+      const rows = product.productVariants.map((v) => [{ text: `🎨 ${v.name} (${v.sku}) — ${money(v.sellingPrice.toFixed(2))}`, callback_data: `od_select_variation:${v.id}` }]);
+      rows.push([{ text: "⬅️ Back", callback_data: "od_search_product" }]);
+      rows.push([{ text: "❌ Cancel", callback_data: "od_cancel" }]);
+      await this.sendOrEdit(ctx, `🎨 <b>${product.name}</b> — Select Variation:`, { inline_keyboard: rows }, messageId);
+    } else {
+      // Simple product — skip variation, go to quantity.
+      draft.pendingProduct = {
+        productId: product.id,
+        productName: product.name,
+        sku: product.sku,
+        unitPrice: product.sellingPrice,
+        unitCost: product.weightedAverageCost || product.purchasePrice,
+        isVariable: false,
+      };
+      draft.step = "quantity";
+      TelegramSessionStore.saveOrderDraft(draft);
+      await this.sendOrEdit(
+        ctx,
+        `📦 <b>${product.name}</b> (${product.sku}) — ${money(product.sellingPrice.toFixed(2))}\n\n🔢 <b>Step 3: Quantity</b>\n\nSend the quantity (e.g. 2):`,
+        { inline_keyboard: [[{ text: "1", callback_data: "od_set_qty:1" }, { text: "2", callback_data: "od_set_qty:2" }, { text: "5", callback_data: "od_set_qty:5" }, { text: "10", callback_data: "od_set_qty:10" }], [{ text: "⬅️ Back", callback_data: "od_search_product" }], [{ text: "❌ Cancel", callback_data: "od_cancel" }]] },
+        messageId,
+      );
+    }
+  },
+
+  async odSelectVariation(ctx: CommandContext, variationId: string, messageId: number | undefined, lang: string) {
+    const draft = TelegramSessionStore.getOrderDraft(ctx.telegramUserId, ctx.chatId);
+    if (!draft) return this.sessionExpired(ctx, messageId);
+    const variant = await db.productVariant.findUnique({ where: { id: variationId } });
+    if (!variant) return TelegramService.sendMessage(ctx.chatId, "❌ Variation not found.");
+    // Update the pending product with the variation's price/cost.
+    if (draft.pendingProduct) {
+      draft.pendingProduct.unitPrice = variant.sellingPrice;
+      draft.pendingVariationId = variant.id;
+    }
+    draft.step = "quantity";
+    TelegramSessionStore.saveOrderDraft(draft);
+    await this.sendOrEdit(
+      ctx,
+      `🎨 ${variant.name} — ${money(variant.sellingPrice.toFixed(2))}\n\n🔢 <b>Step 3: Quantity</b>\n\nSend the quantity:`,
+      { inline_keyboard: [[{ text: "1", callback_data: "od_set_qty:1" }, { text: "2", callback_data: "od_set_qty:2" }, { text: "5", callback_data: "od_set_qty:5" }, { text: "10", callback_data: "od_set_qty:10" }], [{ text: "⬅️ Back", callback_data: "od_search_product" }], [{ text: "❌ Cancel", callback_data: "od_cancel" }]] },
+      messageId,
+    );
+  },
+
+  async odSetQty(ctx: CommandContext, qtyStr: string, messageId: number | undefined, lang: string) {
+    const draft = TelegramSessionStore.getOrderDraft(ctx.telegramUserId, ctx.chatId);
+    if (!draft) return this.sessionExpired(ctx, messageId);
+    return this.odAddItemWithQty(ctx, Number(qtyStr), messageId, lang, draft);
+  },
+
+  async odHandleQuantityInput(ctx: CommandContext, text: string, lang: string, draft: OrderDraft): Promise<boolean> {
+    const qty = Number(text.trim());
+    if (!Number.isFinite(qty) || qty <= 0) {
+      await TelegramService.sendMessage(ctx.chatId, "❌ Invalid quantity. Send a positive number (e.g. 2).");
+      return true;
+    }
+    await this.odAddItemWithQty(ctx, qty, undefined, lang, draft);
+    return true;
+  },
+
+  async odAddItemWithQty(ctx: CommandContext, qty: number, messageId: number | undefined, lang: string, draft: OrderDraft) {
+    if (!draft.pendingProduct) return TelegramService.sendMessage(ctx.chatId, "❌ No product selected. Use /createorder to restart.");
+    draft.items.push({
+      productId: draft.pendingProduct.productId,
+      productName: draft.pendingProduct.productName,
+      sku: draft.pendingProduct.sku,
+      quantity: qty,
+      unitPrice: draft.pendingProduct.unitPrice,
+      unitCost: draft.pendingProduct.unitCost,
+      variationId: draft.pendingVariationId,
+    });
+    draft.pendingProduct = undefined;
+    draft.pendingVariationId = undefined;
+    draft.step = "add_more";
+    TelegramSessionStore.saveOrderDraft(draft);
+    const itemsText = draft.items.map((it, i) => `${i + 1}. ${it.productName} (${it.sku}) × ${it.quantity} = ${money((it.unitPrice * qty).toFixed(2))}`).join("\n");
+    await this.sendOrEdit(
+      ctx,
+      `✅ Added to order.\n\n🛒 <b>Current Items:</b>\n${itemsText}\n\n<b>Add another product?</b>`,
+      { inline_keyboard: [[{ text: "➕ Add Product", callback_data: "od_search_product" }], [{ text: "➡️ Continue to Shipping", callback_data: "od_add_more:done" }], [{ text: "❌ Cancel", callback_data: "od_cancel" }]] },
+      messageId,
+    );
+  },
+
+  async odAddMore(ctx: CommandContext, action: string, messageId: number | undefined, lang: string) {
+    const draft = TelegramSessionStore.getOrderDraft(ctx.telegramUserId, ctx.chatId);
+    if (!draft) return this.sessionExpired(ctx, messageId);
+    if (action === "done") {
+      draft.step = "shipping";
+      TelegramSessionStore.saveOrderDraft(draft);
+      const subtotal = draft.items.reduce((s, it) => s + it.unitPrice * it.quantity, 0);
+      await this.sendOrEdit(
+        ctx,
+        `🚚 <b>Step 4: Shipping Cost</b>\n\nSubtotal: ${money(subtotal.toFixed(2))}\n\nSend the shipping cost (or 0 for none):`,
+        { inline_keyboard: [[{ text: "0 (Free Shipping)", callback_data: "od_set_shipping:0" }], [{ text: "❌ Cancel", callback_data: "od_cancel" }]] },
+        messageId,
+      );
+    }
+  },
+
+  async odHandleShippingInput(ctx: CommandContext, text: string, lang: string, draft: OrderDraft): Promise<boolean> {
+    const shipping = Number(text.trim());
+    if (!Number.isFinite(shipping) || shipping < 0) {
+      await TelegramService.sendMessage(ctx.chatId, "❌ Invalid amount. Send a number (e.g. 100 or 0).");
+      return true;
+    }
+    draft.shippingCost = shipping;
+    draft.step = "discount";
+    TelegramSessionStore.saveOrderDraft(draft);
+    const subtotal = draft.items.reduce((s, it) => s + it.unitPrice * it.quantity, 0);
+    await TelegramService.sendMessage(
+      ctx.chatId,
+      `✅ Shipping: ${money(shipping.toFixed(2))}\n\nSubtotal + Shipping: ${money((subtotal + shipping).toFixed(2))}\n\n🏷️ <b>Step 5: Discount</b>\n\nSend the discount amount (or 0 for none):`,
+      { inline_keyboard: [[{ text: "0 (No Discount)", callback_data: "od_set_discount:0" }], [{ text: "❌ Cancel", callback_data: "od_cancel" }]] },
+    );
+    return true;
+  },
+
+  async odSetShipping(ctx: CommandContext, messageId: number | undefined, lang: string) {
+    const draft = TelegramSessionStore.getOrderDraft(ctx.telegramUserId, ctx.chatId);
+    if (!draft) return this.sessionExpired(ctx, messageId);
+    draft.step = "shipping";
+    TelegramSessionStore.saveOrderDraft(draft);
+    await TelegramService.sendMessage(ctx.chatId, "Send the shipping cost (or 0 for none):");
+  },
+
+  async odSetDiscount(ctx: CommandContext, messageId: number | undefined, lang: string) {
+    const draft = TelegramSessionStore.getOrderDraft(ctx.telegramUserId, ctx.chatId);
+    if (!draft) return this.sessionExpired(ctx, messageId);
+    draft.step = "discount";
+    TelegramSessionStore.saveOrderDraft(draft);
+    await TelegramService.sendMessage(ctx.chatId, "Send the discount amount (or 0 for none):");
+  },
+
+  async odHandleDiscountInput(ctx: CommandContext, text: string, lang: string, draft: OrderDraft): Promise<boolean> {
+    const discount = Number(text.trim());
+    if (!Number.isFinite(discount) || discount < 0) {
+      await TelegramService.sendMessage(ctx.chatId, "❌ Invalid amount. Send a number (e.g. 50 or 0).");
+      return true;
+    }
+    draft.discount = discount;
+    draft.step = "payment_method";
+    TelegramSessionStore.saveOrderDraft(draft);
+    await TelegramService.sendMessage(
+      ctx.chatId,
+      `✅ Discount: ${money(discount.toFixed(2))}\n\n💳 <b>Step 6: Payment Method</b>\n\nSelect payment method:`,
+      {
+        inline_keyboard: [
+          [{ text: "💵 CASH", callback_data: "od_set_payment_method:CASH" }, { text: "📱 bKash", callback_data: "od_set_payment_method:BKASH" }],
+          [{ text: "📱 Nagad", callback_data: "od_set_payment_method:NAGAD" }, { text: "🏦 BANK", callback_data: "od_set_payment_method:BANK" }],
+          [{ text: "💳 CARD", callback_data: "od_set_payment_method:CARD" }, { text: "OTHER", callback_data: "od_set_payment_method:OTHER" }],
+          [{ text: "⏭️ No Payment (Due)", callback_data: "od_set_payment_method:NONE" }],
+          [{ text: "❌ Cancel", callback_data: "od_cancel" }],
+        ],
+      },
+    );
+    return true;
+  },
+
+  async odSetPaymentMethod(ctx: CommandContext, method: string, messageId: number | undefined, lang: string) {
+    const draft = TelegramSessionStore.getOrderDraft(ctx.telegramUserId, ctx.chatId);
+    if (!draft) return this.sessionExpired(ctx, messageId);
+    if (method === "NONE") {
+      draft.paymentMethod = undefined;
+      draft.paymentAmount = 0;
+      return this.odShowSummary(ctx, messageId, lang);
+    }
+    draft.paymentMethod = method;
+    draft.step = "payment_amount";
+    TelegramSessionStore.saveOrderDraft(draft);
+    const subtotal = draft.items.reduce((s, it) => s + it.unitPrice * it.quantity, 0);
+    const total = subtotal + draft.shippingCost - draft.discount;
+    await this.sendOrEdit(
+      ctx,
+      `💳 Payment Method: <b>${method}</b>\n\n💰 <b>Step 7: Payment Amount</b>\n\nOrder Total: ${money(total.toFixed(2))}\n\nSend the amount the customer paid (or 0 for due):`,
+      { inline_keyboard: [[{ text: `Full (${money(total.toFixed(2))})`, callback_data: `od_set_payment_amount:${total}` }], [{ text: "0 (Due)", callback_data: "od_set_payment_amount:0" }], [{ text: "❌ Cancel", callback_data: "od_cancel" }]] },
+      messageId,
+    );
+  },
+
+  async odHandlePaymentAmountInput(ctx: CommandContext, text: string, lang: string, draft: OrderDraft): Promise<boolean> {
+    const amount = Number(text.trim());
+    if (!Number.isFinite(amount) || amount < 0) {
+      await TelegramService.sendMessage(ctx.chatId, "❌ Invalid amount. Send a number.");
+      return true;
+    }
+    draft.paymentAmount = amount;
+    TelegramSessionStore.saveOrderDraft(draft);
+    await this.odShowSummary(ctx, undefined, lang);
+    return true;
+  },
+
+  async odSetPaymentAmount(ctx: CommandContext, messageId: number | undefined, lang: string) {
+    const draft = TelegramSessionStore.getOrderDraft(ctx.telegramUserId, ctx.chatId);
+    if (!draft) return this.sessionExpired(ctx, messageId);
+    draft.step = "payment_amount";
+    TelegramSessionStore.saveOrderDraft(draft);
+    await TelegramService.sendMessage(ctx.chatId, "Send the payment amount:");
+  },
+
+  async odShowSummary(ctx: CommandContext, messageId: number | undefined, lang: string) {
+    const draft = TelegramSessionStore.getOrderDraft(ctx.telegramUserId, ctx.chatId);
+    if (!draft) return this.sessionExpired(ctx, messageId);
+    if (!draft.customerId || draft.items.length === 0) {
+      return TelegramService.sendMessage(ctx.chatId, "❌ Draft incomplete. Use /createorder to restart.");
+    }
+    draft.step = "confirm";
+    TelegramSessionStore.saveOrderDraft(draft);
+    const subtotal = draft.items.reduce((s, it) => s + it.unitPrice * it.quantity, 0);
+    const total = subtotal + draft.shippingCost - draft.discount;
+    const due = total - (draft.paymentAmount ?? 0);
+    const itemsText = draft.items.map((it, i) => `${i + 1}. ${it.productName} (${it.sku}) × ${it.quantity} = ${money((it.unitPrice * it.quantity).toFixed(2))}`).join("\n");
+    const summary =
+      `📋 <b>Order Summary</b>\n\n` +
+      `👤 Customer: ${draft.customerName} (${draft.customerPhone})\n\n` +
+      `📦 Items:\n${itemsText}\n\n` +
+      `Subtotal: ${money(subtotal.toFixed(2))}\n` +
+      `Shipping: ${money(draft.shippingCost.toFixed(2))}\n` +
+      `Discount: -${money(draft.discount.toFixed(2))}\n` +
+      `─────────────\n` +
+      `<b>Total: ${money(total.toFixed(2))}</b>\n\n` +
+      `Payment: ${draft.paymentMethod ? money((draft.paymentAmount ?? 0).toFixed(2)) + " (" + draft.paymentMethod + ")" : "None (Due)"}\n` +
+      `Due: ${money(due.toFixed(2))}\n\n` +
+      `Confirm to create the order?`;
+    await this.sendOrEdit(
+      ctx,
+      summary,
+      {
+        inline_keyboard: [
+          [{ text: "✅ Confirm & Create", callback_data: "od_confirm" }],
+          [{ text: "❌ Cancel", callback_data: "od_cancel" }],
+        ],
+      },
+      messageId,
+    );
+  },
+
+  async odConfirm(ctx: CommandContext, messageId: number | undefined, lang: string) {
+    const draft = TelegramSessionStore.getOrderDraft(ctx.telegramUserId, ctx.chatId);
+    if (!draft) return this.sessionExpired(ctx, messageId);
+    if (!draft.customerId || draft.items.length === 0) {
+      return TelegramService.sendMessage(ctx.chatId, "❌ Draft incomplete. Use /createorder to restart.");
+    }
+    try {
+      const order = await OrderService.create({
+        customerId: draft.customerId,
+        status: "CONFIRMED",
+        shippingCost: draft.shippingCost,
+        discount: draft.discount,
+        items: draft.items.map((it) => ({ productId: it.productId, quantity: it.quantity })),
+        payment: draft.paymentMethod && draft.paymentAmount && draft.paymentAmount > 0
+          ? { amount: draft.paymentAmount, method: draft.paymentMethod }
+          : undefined,
+        createdBy: ctx.user?.id,
+      } as any);
+      TelegramSessionStore.clearOrderDraft(ctx.telegramUserId, ctx.chatId);
+      const total = (order as any)?.total ?? 0;
+      await this.sendOrEdit(
+        ctx,
+        `✅ <b>Order Created!</b>\n\nOrder #: <b>${(order as any)?.orderNumber ?? "—"}</b>\nTotal: ${money(Number(total).toFixed(2))}\nCustomer: ${draft.customerName}\n\nUse /receivepayment to record additional payments.\nUse /order ${(order as any)?.id ?? ""} to view details.`,
+        { inline_keyboard: [[{ text: "📦 View Order", callback_data: `order_view:${(order as any)?.id ?? ""}` }], [{ text: "🏠 Menu", callback_data: "menu" }]] },
+        messageId,
+      );
+    } catch (e) {
+      await TelegramService.sendMessage(ctx.chatId, `❌ Failed to create order: ${(e as Error).message}`);
+    }
+  },
+
+  async odCancel(ctx: CommandContext, messageId: number | undefined, lang: string) {
+    TelegramSessionStore.clearOrderDraft(ctx.telegramUserId, ctx.chatId);
+    await this.sendOrEdit(ctx, "❌ Order creation cancelled.", { inline_keyboard: [[{ text: "🏠 Menu", callback_data: "menu" }]] }, messageId);
+  },
+
+  async odRemoveItem(ctx: CommandContext, indexStr: string, messageId: number | undefined, lang: string) {
+    const draft = TelegramSessionStore.getOrderDraft(ctx.telegramUserId, ctx.chatId);
+    if (!draft) return this.sessionExpired(ctx, messageId);
+    const idx = Number(indexStr);
+    if (Number.isFinite(idx) && idx >= 0 && idx < draft.items.length) {
+      draft.items.splice(idx, 1);
+      TelegramSessionStore.saveOrderDraft(draft);
+    }
+    return this.odShowSummary(ctx, messageId, lang);
+  },
+
+  sessionExpired(ctx: CommandContext, messageId: number | undefined) {
+    TelegramSessionStore.clearOrderDraft(ctx.telegramUserId, ctx.chatId);
+    return this.sendOrEdit(ctx, "⏰ Session expired. Use /createorder to start again.", { inline_keyboard: [[{ text: "🏠 Menu", callback_data: "menu" }]] }, messageId);
+  },
+
+  // ────────────────────────────────────────────────────────────────
   // NEW: /createorder, /updateorder, /cancelorder, /returnorder —
   // raw-pipe commands. Designed for fast one-line order entry from the
   // phone; the alternative would be a multi-step form which is heavier
   // to implement.
   // ────────────────────────────────────────────────────────────────
   // /createorder PHONE|SKU:QTY,SKU:QTY|PAYMENT_METHOD|SHIPPING?
+  // OR /createorder (no args) → interactive multi-step flow
   async cmdCreateOrder(ctx: CommandContext, raw: string, lang: string) {
     if (!this.can(ctx, "orders:create")) return this.deny(ctx, lang);
+    // If no args → start the interactive multi-step flow.
+    if (!raw.trim()) {
+      return this.startInteractiveOrder(ctx, lang);
+    }
+    // Legacy pipe syntax (power users)
     const parts = raw.split("|").map((s: string) => s.trim());
     if (parts.length < 3) {
-      return TelegramService.sendMessage(ctx.chatId, "Usage: /createorder PHONE | SKU:QTY,SKU:QTY | PAYMENT_METHOD | SHIPPING_COST?\n\nPAYMENT_METHOD: CASH, BKASH, NAGAD, BANK, CARD, OTHER");
+      return TelegramService.sendMessage(ctx.chatId, "Usage: /createorder PHONE | SKU:QTY,SKU:QTY | PAYMENT_METHOD | SHIPPING_COST?\n\nPAYMENT_METHOD: CASH, BKASH, NAGAD, BANK, CARD, OTHER\n\nOr send /createorder with no args for the interactive flow.");
     }
     const [phone, itemsRaw, method, shippingStr] = parts;
     if (!phone || !itemsRaw || !method) return TelegramService.sendMessage(ctx.chatId, "❌ Missing phone, items, or payment method.");
