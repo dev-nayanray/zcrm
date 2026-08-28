@@ -5,6 +5,7 @@ import { ok, serverError, validationError, badRequest } from "@/lib/api";
 import { requirePermission, readJsonBody } from "@/lib/guards";
 import { createExpenseSchema } from "@/lib/validation";
 import { AuditService } from "@/lib/services/audit";
+import { ProfitabilityService } from "@/lib/services/profitability";
 import { parsePagination } from "@/lib/query";
 
 export async function GET(request: NextRequest) {
@@ -13,11 +14,17 @@ export async function GET(request: NextRequest) {
     if (err) return err;
     const q = parsePagination(request.nextUrl.searchParams);
     const categoryId = request.nextUrl.searchParams.get("categoryId") || undefined;
+    const orderId = request.nextUrl.searchParams.get("orderId") || undefined;
+    const supplierId = request.nextUrl.searchParams.get("supplierId") || undefined;
+    const warehouseId = request.nextUrl.searchParams.get("warehouseId") || undefined;
     const from = request.nextUrl.searchParams.get("from");
     const to = request.nextUrl.searchParams.get("to");
     const where: Prisma.ExpenseWhereInput = {};
     if (q.search) where.description = { contains: q.search };
     if (categoryId) where.categoryId = categoryId;
+    if (orderId) where.orderId = orderId;
+    if (supplierId) where.supplierId = supplierId;
+    if (warehouseId) where.warehouseId = warehouseId;
     if (from || to) {
       const expenseDate: Record<string, Date> = {};
       if (from) expenseDate.gte = new Date(from);
@@ -32,6 +39,9 @@ export async function GET(request: NextRequest) {
         take: q.limit,
         include: {
           category: true,
+          order: { select: { id: true, orderNumber: true } },
+          supplier: { select: { id: true, name: true } },
+          warehouse: { select: { id: true, name: true } },
           creator: { select: { id: true, name: true } },
         },
       }),
@@ -67,11 +77,30 @@ export async function POST(request: NextRequest) {
         description: data.description,
         reference: data.reference,
         expenseDate: data.expenseDate ? new Date(data.expenseDate) : new Date(),
+        orderId: data.orderId ?? null,
+        supplierId: data.supplierId ?? null,
+        warehouseId: data.warehouseId ?? null,
         createdBy: user!.id,
       },
-      include: { category: true },
+      include: { category: true, order: { select: { id: true, orderNumber: true } }, supplier: { select: { id: true, name: true } }, warehouse: { select: { id: true, name: true } } },
     });
-    await AuditService.log({ userId: user!.id, action: "EXPENSE_CREATE", entity: "Expense", entityId: expense.id, changes: { amount: data.amount } });
+    await AuditService.log({ userId: user!.id, action: "EXPENSE_CREATE", entity: "Expense", entityId: expense.id, changes: { amount: data.amount, orderId: data.orderId ?? null, supplierId: data.supplierId ?? null, warehouseId: data.warehouseId ?? null } });
+
+    // If this expense is linked to an order, re-persist the order's
+    // profitability snapshot so the order-detail view reflects the new
+    // cost immediately. (The aggregate P&L recomputes from live data, but
+    // the per-order snapshot is stored and must be refreshed.)
+    if (data.orderId) {
+      try {
+        await db.$transaction(async (tx) => {
+          await ProfitabilityService.persistSnapshot(data.orderId!, tx);
+        });
+      } catch (snapErr) {
+        // Snapshot refresh failure must NOT fail the expense creation.
+        console.error("[Expense] snapshot refresh failed:", snapErr);
+      }
+    }
+
     return ok({ ...expense, amount: expense.amount.toFixed(2) });
   } catch (e) {
     return serverError((e as Error).message);

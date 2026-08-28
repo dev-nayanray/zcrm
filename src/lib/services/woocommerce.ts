@@ -276,7 +276,147 @@ export const WooCommerceService = {
     }
 
     await this.upsertSyncLog({ entity: "product", externalId: String(wooProduct.id), operation: "sync", status: "SUCCESS", payload: { sku } });
+
+    // ── Variable products: auto-sync their variations ──
+    // A WooCommerce product with type="variable" has child variations. We
+    // fetch them from /products/{id}/variations and sync each one. This is
+    // a fire-and-forget — if variation sync fails, the parent product sync
+    // still succeeded (logged separately to SyncLog).
+    if (wooProduct.type === "variable") {
+      try {
+        await this.bulkSyncVariations(wooProduct.id);
+      } catch (e) {
+        // Logged inside bulkSyncVariations; don't fail the parent sync.
+        console.error(`[WooCommerce] variation sync for parent ${wooProduct.id} failed:`, e);
+      }
+    }
+
     return product;
+  },
+
+  // ─────────────────────────────────────────────────────────────────────
+  // Variable Products & Variations
+  //
+  // A WooCommerce variable product is a PARENT product with type="variable"
+  // and one or more VARIATIONS (children). Each variation has its own SKU,
+  // price, stock, and attributes (e.g. "Color=Red, Size=L").
+  //
+  // In Z-CRM:
+  //   • The parent variable product syncs as a regular Product (no stock —
+  //     the parent itself is not sellable; only its variations are).
+  //   • Each variation syncs as a ProductVariant row linked to the parent
+  //     Product via ProductVariant.externalId (= Woo variation id, @unique).
+  //
+  // syncOrder already prefers variation_id over product_id when looking up
+  // the product (woocommerce.ts:syncOrder). With variants now synced, those
+  // line items will resolve correctly instead of being silently dropped.
+  // ─────────────────────────────────────────────────────────────────────
+
+  // Sync a single WooCommerce variation. Idempotent by ProductVariant.externalId.
+  // The parent product MUST already exist (sync it first via syncProduct).
+  async syncVariation(wooVariation: {
+    id: number;
+    parent_id?: number;
+    sku?: string;
+    regular_price?: string;
+    sale_price?: string;
+    price?: string;
+    stock_quantity?: number | null;
+    manage_stock?: boolean;
+    attributes?: { id?: number; name?: string; option?: string }[];
+    image?: { src?: string };
+    status?: string;
+  }) {
+    const externalId = String(wooVariation.id);
+    // Resolve the parent product by Woo parent_id.
+    if (!wooVariation.parent_id) {
+      await this.upsertSyncLog({ entity: "variation", externalId, operation: "sync", status: "FAILED", message: "No parent_id" });
+      throw new Error("Variation has no parent_id");
+    }
+    const parent = await db.product.findUnique({ where: { externalId: String(wooVariation.parent_id) } });
+    if (!parent) {
+      await this.upsertSyncLog({ entity: "variation", externalId, operation: "sync", status: "FAILED", message: `Parent product ${wooVariation.parent_id} not synced` });
+      throw new Error(`Parent product (Woo id ${wooVariation.parent_id}) not found. Sync the parent product first.`);
+    }
+
+    const sku = wooVariation.sku || `WOO-VAR-${wooVariation.id}`;
+    const regularPrice = toDecimal(wooVariation.regular_price || 0);
+    const salePrice = toDecimal(wooVariation.sale_price || 0);
+    const sellingPrice = salePrice.gt(0) ? salePrice : regularPrice;
+    const imageUrl = wooVariation.image?.src ?? null;
+    // Build a human-readable name from attributes: "Red / L"
+    const attrParts = (wooVariation.attributes ?? [])
+      .filter((a) => a.option)
+      .map((a) => a.option as string);
+    const name = attrParts.length > 0 ? attrParts.join(" / ") : `Variation ${wooVariation.id}`;
+    const attributesJson = wooVariation.attributes ? JSON.stringify(wooVariation.attributes) : null;
+
+    const data = {
+      productId: parent.id,
+      sku,
+      name,
+      attributes: attributesJson,
+      sellingPrice: sellingPrice.toNumber(),
+      purchasePrice: 0, // Woo doesn't expose cost; inherited from parent until a purchase lands
+      stock: wooVariation.manage_stock && typeof wooVariation.stock_quantity === "number" ? wooVariation.stock_quantity : 0,
+      imageUrl,
+      externalId,
+      isActive: wooVariation.status !== "draft",
+    };
+
+    const existing = await db.productVariant.findUnique({ where: { externalId } });
+    let variant;
+    if (existing) {
+      variant = await db.productVariant.update({
+        where: { id: existing.id },
+        data: { ...data, sku: wooVariation.sku ? sku : existing.sku },
+      });
+    } else {
+      // Ensure SKU is unique — append Woo id on collision.
+      const skuCollision = await db.productVariant.findUnique({ where: { sku } });
+      if (skuCollision) data.sku = `${sku}-${wooVariation.id}`;
+      variant = await db.productVariant.create({ data });
+    }
+
+    await this.upsertSyncLog({ entity: "variation", externalId, operation: "sync", status: "SUCCESS", payload: { sku, parentProductId: parent.id } });
+    return variant;
+  },
+
+  // Bulk sync all variations for a variable product. Fetches them from the
+  // Woo REST API endpoint /products/{id}/variations.
+  async bulkSyncVariations(parentProductId: number) {
+    const cfg = await this.getConfig();
+    if (!cfg) throw new Error("WooCommerce not configured");
+    let page = 1;
+    let synced = 0;
+    let failed = 0;
+    while (page <= MAX_BULK_PAGES) {
+      const url = this.buildUrl(cfg, `/products/${parentProductId}/variations`, { per_page: BULK_PAGE_SIZE, page });
+      const res = await fetch(url);
+      if (!res.ok) break;
+      const variations = (await res.json()) as any[];
+      if (!variations.length) break;
+      for (const v of variations) {
+        try {
+          await this.syncVariation(v);
+          synced++;
+        } catch (e) {
+          failed++;
+          await this.upsertSyncLog({ entity: "variation", externalId: String(v.id), operation: "sync", status: "FAILED", message: (e as Error).message });
+        }
+      }
+      if (variations.length < BULK_PAGE_SIZE) break;
+      page++;
+    }
+    await this.setLastSync();
+    await AuditService.log({
+      userId: (await getCurrentUser())?.id,
+      action: "WOOCOMMERCE_SYNC",
+      entity: "Integration",
+      entityId: "woocommerce",
+      changes: { type: "variations", parentProductId, synced, failed },
+    });
+    return { synced, failed };
   },
 
   // Sync a WooCommerce customer. Idempotent by externalId (now `@unique`),
@@ -320,15 +460,21 @@ export const WooCommerceService = {
     status?: string;
     customer_id?: number;
     billing?: { first_name?: string; last_name?: string; phone?: string; email?: string; address_1?: string; city?: string };
-    line_items?: { product_id?: number; variation_id?: number; quantity?: number; total?: string; name?: string }[];
+    line_items?: { product_id?: number; variation_id?: number; quantity?: number; total?: string; name?: string; subtotal?: string; total_tax?: string }[];
     discount_total?: string;
     shipping_total?: string;
     total?: string;
+    total_tax?: string;
     payment_method?: string;
     payment_method_title?: string;
     date_created?: string;
     date_paid?: string;
     customer_note?: string;
+    // WooCommerce fee_lines — additional fees charged to the customer
+    // (e.g. payment gateway fee, COD fee). Each has a total + total_tax.
+    fee_lines?: { id?: number; name?: string; total?: string; total_tax?: string }[];
+    // WooCommerce shipping_lines — actual shipping charges
+    shipping_lines?: { id?: number; method_title?: string; total?: string; total_tax?: string }[];
   }) {
     const externalId = String(wooOrder.id);
     const existing = await db.order.findUnique({ where: { externalId }, include: { items: true } });
@@ -361,19 +507,58 @@ export const WooCommerceService = {
       customerId = c.id;
     }
 
-    // Resolve order items from CRM products by externalId
+    // Resolve order items from CRM products by externalId.
+    // If a line item has a variation_id, look up the ProductVariant first
+    // (the variation's parent product is NOT directly sellable). If the
+    // variant doesn't exist, fall back to the parent product_id so the order
+    // still syncs (with a warning in the sync log).
     const items: { productId: string; quantity: Prisma.Decimal }[] = [];
     for (const li of wooOrder.line_items ?? []) {
-      // Prefer variation_id when present (variable products), else product_id
-      const wooProductId = li.variation_id && li.variation_id !== 0 ? li.variation_id : li.product_id;
-      if (!wooProductId) continue;
-      const product = await db.product.findUnique({ where: { externalId: String(wooProductId) } });
+      let product: { id: string } | null = null;
+      if (li.variation_id && li.variation_id !== 0) {
+        // Look up the variant by externalId; the variant's productId is
+        // the CRM Product we attach to the order item.
+        const variant = await db.productVariant.findUnique({
+          where: { externalId: String(li.variation_id) },
+          select: { id: true, productId: true },
+        });
+        if (variant) {
+          product = { id: variant.productId };
+        } else {
+          // Variant not synced yet — fall back to the parent product.
+          if (li.product_id) {
+            product = await db.product.findUnique({ where: { externalId: String(li.product_id) }, select: { id: true } });
+          }
+        }
+      } else if (li.product_id) {
+        product = await db.product.findUnique({ where: { externalId: String(li.product_id) }, select: { id: true } });
+      }
       if (!product) continue;
       items.push({ productId: product.id, quantity: toDecimal(li.quantity ?? 1) });
     }
     if (items.length === 0) {
       await this.upsertSyncLog({ entity: "order", externalId, operation: "sync", status: "FAILED", message: "No matching products" });
       throw new Error("Order has no matching products");
+    }
+
+    // Extract tax & fees from the Woo payload.
+    // - total_tax: the order-level sales tax (VAT) charged to the customer.
+    // - fee_lines: extra fees (e.g. payment gateway fee, COD fee). The
+    //   customer pays these as part of order.total, but they're not part of
+    //   the product subtotal. We map them to Order.paymentFee (gateway fee)
+    //   and Order.platformFee (other marketplace fees) — splitting based
+    //   on the fee name.
+    const tax = toDecimal(wooOrder.total_tax ?? 0);
+    let paymentFee = new Prisma.Decimal(0);
+    let platformFee = new Prisma.Decimal(0);
+    for (const fee of wooOrder.fee_lines ?? []) {
+      const name = (fee.name ?? "").toLowerCase();
+      const amt = toDecimal(fee.total ?? 0);
+      if (name.includes("payment") || name.includes("gateway") || name.includes("bkash") || name.includes("nagad") || name.includes("card")) {
+        paymentFee = paymentFee.plus(amt);
+      } else {
+        platformFee = platformFee.plus(amt);
+      }
     }
 
     // Find website channel
@@ -401,13 +586,17 @@ export const WooCommerceService = {
     }
 
     // New order — create via OrderService.create (which handles idempotency,
-    // COGS snapshotting, stock movements, payment recording, audit log).
+    // COGS snapshotting, stock movements, payment recording, audit log,
+    // and computes the full financial snapshot including tax/fees).
     const order = await OrderService.create({
       customerId,
       channelId: websiteChannel.id,
       status: WOO_TO_CRM_STATUS[wooOrder.status ?? "processing"] ?? "CONFIRMED",
       discount: toDecimal(wooOrder.discount_total ?? 0),
+      tax,                                    // NEW: sales tax from Woo
       shippingCost: toDecimal(wooOrder.shipping_total ?? 0),
+      paymentFee,                             // NEW: gateway fees from fee_lines
+      platformFee,                            // NEW: marketplace fees from fee_lines
       otherCost: 0,
       notes: wooOrder.customer_note ?? `Synced from WooCommerce #${wooOrder.number ?? wooOrder.id}`,
       sourceChannel: "Website",
@@ -420,7 +609,7 @@ export const WooCommerceService = {
       } : undefined,
     });
 
-    await this.upsertSyncLog({ entity: "order", externalId, operation: "sync", status: "SUCCESS", payload: { orderId: order?.id } });
+    await this.upsertSyncLog({ entity: "order", externalId, operation: "sync", status: "SUCCESS", payload: { orderId: order?.id, tax: tax.toFixed(2), paymentFee: paymentFee.toFixed(2), platformFee: platformFee.toFixed(2) } });
     await this.setLastSync();
     return order;
   },

@@ -3,7 +3,7 @@ import { ok, serverError, badRequest } from "@/lib/api";
 import { requirePermission } from "@/lib/guards";
 import { WooCommerceService } from "@/lib/services/woocommerce";
 
-// POST ?entity=products|orders|categories — trigger a bulk sync
+// POST ?entity=products|orders|categories|variations&parentId=N — trigger a bulk sync
 export async function POST(request: NextRequest) {
   try {
     const [, err] = await requirePermission("integrations:sync");
@@ -21,7 +21,15 @@ export async function POST(request: NextRequest) {
       const result = await WooCommerceService.bulkSyncCategories();
       return ok(result);
     }
-    return badRequest("Use ?entity=products | orders | categories");
+    if (entity === "variations") {
+      const parentIdStr = request.nextUrl.searchParams.get("parentId");
+      if (!parentIdStr) return badRequest("?entity=variations requires ?parentId=N (the WooCommerce parent product id)");
+      const parentId = Number(parentIdStr);
+      if (!Number.isFinite(parentId)) return badRequest("parentId must be a number");
+      const result = await WooCommerceService.bulkSyncVariations(parentId);
+      return ok(result);
+    }
+    return badRequest("Use ?entity=products | orders | categories | variations");
   } catch (e) {
     return serverError((e as Error).message);
   }

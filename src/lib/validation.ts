@@ -191,6 +191,11 @@ export const createExpenseSchema = z.object({
   description: z.string().optional(),
   reference: z.string().optional(),
   expenseDate: z.string().optional(),
+  // Optional links — order-specific / supplier / warehouse expenses.
+  // General business expenses leave all three null.
+  orderId: id.optional(),
+  supplierId: id.optional(),
+  warehouseId: id.optional(),
 });
 
 export const updateExpenseSchema = createExpenseSchema.partial();

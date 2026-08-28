@@ -163,6 +163,10 @@ export const TelegramCommandService = {
       "/cogs": this.cmdCogs,
       "/sales": this.cmdSales,
       "/duereport": this.cmdDueReport,
+      // ── NEW: return + refund management ──
+      "/approvereturn": this.cmdApproveReturn,
+      "/refund": this.cmdRefund,
+      "/receivepurchase": this.cmdReceivePurchase,
     };
 
     // Commands that take raw "|"-separated text after the command (not the
@@ -180,6 +184,14 @@ export const TelegramCommandService = {
       "/updateorder": this.cmdUpdateOrder,
       "/cancelorder": this.cmdCancelOrder,
       "/returnorder": this.cmdReturnOrder,
+      // ── NEW: customer / supplier / category / product updates ──
+      "/addcustomer": this.cmdAddCustomer,
+      "/updatecustomer": this.cmdUpdateCustomer,
+      "/updateproduct": this.cmdUpdateProduct,
+      "/updatecategory": this.cmdUpdateCategory,
+      "/updatesupplier": this.cmdUpdateSupplier,
+      // ── NEW: purchase creation (pipe-delimited) ──
+      "/createpurchase": this.cmdCreatePurchase,
     };
     if (rawTextCommands[command]) {
       try {
@@ -609,6 +621,17 @@ export const TelegramCommandService = {
     if (can("reports:read") || can("dashboard:read")) cmds.push("/sales — sales report (default: this month)");
     if (can("reports:read") || can("dashboard:read")) cmds.push("/cogs — COGS + gross margin (default: this month)");
     if (can("reports:read") || can("customers:read")) cmds.push("/duereport — customer due aging buckets");
+    // NEW Phase 3 commands
+    if (can("customers:create")) cmds.push("/addcustomer Name | Phone | Email? | City? — add customer");
+    if (can("customers:update")) cmds.push("/updatecustomer ID | Name? | Phone? | Email? | City? — update customer");
+    if (can("products:update")) cmds.push("/updateproduct ID | SellingPrice? | PurchasePrice? | Status? — update product (pushes to Woo)");
+    if (can("categories:update")) cmds.push("/updatecategory ID | Name? | Description? — update category");
+    if (can("suppliers:update")) cmds.push("/updatesupplier ID | Name? | Phone? | Email? | Address? — update supplier");
+    if (can("purchases:create")) cmds.push("/createpurchase SupplierID | SKU:QTY:COST,... | Paid? | Shipping? — create + receive purchase");
+    if (can("purchases:update")) cmds.push("/receivepurchase PurchaseID — receive pending purchase");
+    if (can("returns:update")) cmds.push("/approvereturn RETURN_ID — approve pending return (applies stock + refund)");
+    if (can("payments:refund")) cmds.push("/refund ORDER_ID | AMOUNT | METHOD? | REF? — record refund");
+    if (can("stock_transfers:read")) cmds.push("/transfers — list stock transfers");
     const text = `<b>Z-CRM Bot Commands</b>\n\nRole: <b>${ctx.roleName}</b>\nGroup: ${ctx.group.chatTitle}\n\n${cmds.map((c) => "• " + c).join("\n")}`;
     await TelegramService.sendMessage(ctx.chatId, text);
   },
@@ -1231,12 +1254,34 @@ export const TelegramCommandService = {
     if (!Number.isFinite(amount) || amount <= 0) return TelegramService.sendMessage(ctx.chatId, "❌ Invalid amount.");
     const order = await db.order.findUnique({ where: { id: orderId } });
     if (!order) return TelegramService.sendMessage(ctx.chatId, "❌ Order not found. Use the order ID (not the order number).");
-    await db.payment.create({
-      data: { orderId: order.id, customerId: order.customerId, amount, method: method.toUpperCase(), transactionReference: ref ?? null, createdBy: ctx.user?.id },
-    });
-    // Recompute payment status (idempotent)
-    await OrderService.recomputePaymentStatus(order.id);
-    await TelegramService.sendMessage(ctx.chatId, `✅ Payment of ${money(amount.toFixed(2))} recorded for order ${order.orderNumber}.`);
+    // ── Use PaymentService.create (NOT direct db.payment.create) ──
+    // This enforces all integrity guards:
+    //   - rejects payments on CANCELLED/REFUNDED/RETURN_REQUESTED orders
+    //   - prevents overpayment
+    //   - idempotent on transactionReference (duplicate ref → returns existing)
+    //   - writes PAYMENT_CREATE audit log
+    //   - fires PAYMENT_RECEIVED automation + Telegram notification
+    try {
+      const payment = await PaymentService.create({
+        orderId: order.id,
+        amount,
+        method: method.toUpperCase(),
+        transactionReference: ref || undefined,
+        createdBy: ctx.user?.id,
+      });
+      const paid = await db.order.findUnique({ where: { id: order.id } });
+      await TelegramService.sendMessage(ctx.chatId,
+        `✅ Payment recorded for order ${order.orderNumber}\n` +
+        `Amount: ${money(amount.toFixed(2))} (${method.toUpperCase()})\n` +
+        `Order Total: ${money(Number(paid?.total ?? 0).toFixed(2))}\n` +
+        `Paid: ${money(Number(paid?.paidAmount ?? 0).toFixed(2))}\n` +
+        `Status: ${paid?.paymentStatus ?? "UNPAID"}` +
+        (ref ? `\nReference: ${ref}` : "")
+      );
+      void payment;
+    } catch (e) {
+      await TelegramService.sendMessage(ctx.chatId, `❌ ${(e as Error).message}`);
+    }
   },
 
   async cmdLowStock(ctx: CommandContext, _args: string[], lang: string) {
@@ -1567,23 +1612,225 @@ export const TelegramCommandService = {
   async cmdReturnOrder(ctx: CommandContext, raw: string, lang: string) {
     if (!this.can(ctx, "returns:create")) return this.deny(ctx, lang);
     const [orderId, type, reason] = raw.split("|").map((s: string) => s.trim());
-    if (!orderId) return TelegramService.sendMessage(ctx.chatId, "Usage: /returnorder ORDER_ID | TYPE? | REASON?\n\nTYPE: RETURN (default) | EXCHANGE");
+    if (!orderId) return TelegramService.sendMessage(ctx.chatId, "Usage: /returnorder ORDER_ID | TYPE? | REASON?\n\nTYPE: RETURN (default) | EXCHANGE\n\nCreates a PENDING return request. An admin must approve it (via web dashboard or /approvereturn) to apply stock movement + refund.");
     const order = await db.order.findUnique({ where: { id: orderId }, include: { items: true } });
     if (!order) return TelegramService.sendMessage(ctx.chatId, "❌ Order not found.");
-    const ret = await db.return.create({
-      data: {
+    // ── Use ReturnService.request (NOT direct db.return.create) ──
+    // This enforces:
+    //   - validates the order is in a returnable state (SHIPPED/DELIVERED/COMPLETED)
+    //   - validates returned quantities ≤ ordered − already-returned
+    //   - transitions the order to RETURN_REQUESTED via the state machine
+    //   - writes RETURN_REQUEST audit log
+    // Stock movement + refund are NOT applied here — they happen when an
+    // admin calls /approvereturn (which calls ReturnService.approve).
+    try {
+      const ret = await ReturnService.request({
         orderId: order.id,
-        customerId: order.customerId,
-        status: "PENDING",
         type: (type || "RETURN").toUpperCase(),
         reason: reason || "Returned via Telegram",
-        refundAmount: 0,
+        items: order.items.map((it: any) => ({ productId: it.productId, quantity: it.quantity, condition: "GOOD" as const })),
         createdBy: ctx.user?.id,
-        items: { create: order.items.map((it: any) => ({ productId: it.productId, quantity: it.quantity, condition: "GOOD" })) },
-      },
-      include: { items: true },
-    });
-    await TelegramService.sendMessage(ctx.chatId, `✅ Return created: <b>${(ret as any).id}</b>\nType: ${ret.type}\nItems: ${ret.items.length}\n\nUse the web dashboard to approve & process stock refund.`);
+      });
+      await TelegramService.sendMessage(ctx.chatId,
+        `✅ Return request created: <b>${ret.id}</b>\n` +
+        `Order: ${order.orderNumber}\n` +
+        `Type: ${ret.type}\n` +
+        `Items: ${ret.items.length}\n\n` +
+        `Status: PENDING — an admin must approve this return to apply stock movement and issue any refund.\n` +
+        `Use: /approvereturn ${ret.id}`
+      );
+    } catch (e) {
+      await TelegramService.sendMessage(ctx.chatId, `❌ ${(e as Error).message}`);
+    }
+  },
+
+  // ── NEW: /approvereturn RETURN_ID — approve a PENDING return ──
+  // Applies the stock movement (RETURN or DAMAGED_RETURN) and creates the
+  // refund (if refundAmount > 0). Transitions the return PENDING → COMPLETED
+  // and the order → RETURNED if all items are returned.
+  async cmdApproveReturn(ctx: CommandContext, args: string[], lang: string) {
+    if (!this.can(ctx, "returns:update")) return this.deny(ctx, lang);
+    const returnId = args[0]?.trim();
+    if (!returnId) return TelegramService.sendMessage(ctx.chatId, "Usage: /approvereturn RETURN_ID\n\nApproves a PENDING return: applies stock movement + refund, transitions order to RETURNED if all items returned.");
+    try {
+      const ret = await ReturnService.approve(returnId);
+      await TelegramService.sendMessage(ctx.chatId, `✅ Return ${ret.id} approved.\nStatus: ${ret.status}\n\nStock movements applied. Refund (if any) recorded against the order.`);
+    } catch (e) {
+      await TelegramService.sendMessage(ctx.chatId, `❌ ${(e as Error).message}`);
+    }
+  },
+
+  // ── NEW: /refund ORDER_ID | AMOUNT | METHOD | REF? ──
+  // Records a standalone refund (not tied to a return). Uses RefundService
+  // which validates amount ≤ paidAmount and re-persists the profitability
+  // snapshot.
+  async cmdRefund(ctx: CommandContext, args: string[], lang: string) {
+    if (!this.can(ctx, "payments:refund")) return this.deny(ctx, lang);
+    const [orderId, amountStr, method, ref] = args.join(" ").split("|").map((s: string) => s.trim());
+    if (!orderId || !amountStr) {
+      return TelegramService.sendMessage(ctx.chatId, "Usage: /refund ORDER_ID | AMOUNT | METHOD? | REFERENCE?\n\nRecords a refund against the order. Method defaults to CASH.");
+    }
+    const amount = Number(amountStr);
+    if (!Number.isFinite(amount) || amount <= 0) return TelegramService.sendMessage(ctx.chatId, "❌ Invalid amount.");
+    try {
+      const { RefundService } = await import("./return");
+      const refund = await RefundService.create({
+        orderId,
+        amount,
+        method: method || "CASH",
+        transactionReference: ref || undefined,
+        createdBy: ctx.user?.id,
+      });
+      const order = await db.order.findUnique({ where: { id: orderId } });
+      await TelegramService.sendMessage(ctx.chatId,
+        `✅ Refund recorded: <b>${refund.id}</b>\n` +
+        `Order: ${order?.orderNumber ?? orderId}\n` +
+        `Amount: ${money(amount.toFixed(2))}\n` +
+        `Method: ${refund.method}\n` +
+        `Order Payment Status: ${order?.paymentStatus ?? "—"}`
+      );
+    } catch (e) {
+      await TelegramService.sendMessage(ctx.chatId, `❌ ${(e as Error).message}`);
+    }
+  },
+
+  // ── NEW: /addcustomer Name | Phone | Email? | City? ──
+  async cmdAddCustomer(ctx: CommandContext, raw: string, lang: string) {
+    if (!this.can(ctx, "customers:create")) return this.deny(ctx, lang);
+    const [name, phone, email, city] = raw.split("|").map((s: string) => s.trim());
+    if (!name || !phone) return TelegramService.sendMessage(ctx.chatId, "Usage: /addcustomer Name | Phone | Email? | City?");
+    try {
+      const existing = await db.customer.findUnique({ where: { phone } });
+      if (existing) return TelegramService.sendMessage(ctx.chatId, `❌ Customer already exists: ${existing.name} (${existing.phone})`);
+      const c = await db.customer.create({ data: { name, phone, email: email || undefined, city: city || undefined } });
+      await AuditService.log({ userId: ctx.user?.id, action: "CUSTOMER_CREATE", entity: "Customer", entityId: c.id, changes: { name, phone }, source: "TELEGRAM" } as any);
+      await TelegramService.sendMessage(ctx.chatId, `✅ Customer created: <b>${c.name}</b>\nPhone: ${c.phone}${email ? `\nEmail: ${email}` : ""}${city ? `\nCity: ${city}` : ""}`);
+    } catch (e) {
+      await TelegramService.sendMessage(ctx.chatId, `❌ ${(e as Error).message}`);
+    }
+  },
+
+  // ── NEW: /updatecustomer ID | Name? | Phone? | Email? | City? ──
+  async cmdUpdateCustomer(ctx: CommandContext, raw: string, lang: string) {
+    if (!this.can(ctx, "customers:update")) return this.deny(ctx, lang);
+    const [id, name, phone, email, city] = raw.split("|").map((s: string) => s.trim());
+    if (!id) return TelegramService.sendMessage(ctx.chatId, "Usage: /updatecustomer ID | Name? | Phone? | Email? | City?\n\nLeave a field blank to keep the existing value.");
+    const existing = await db.customer.findUnique({ where: { id } });
+    if (!existing) return TelegramService.sendMessage(ctx.chatId, "❌ Customer not found.");
+    const data: any = {};
+    if (name) data.name = name;
+    if (phone) data.phone = phone;
+    if (email) data.email = email;
+    if (city) data.city = city;
+    const updated = await db.customer.update({ where: { id }, data });
+    await TelegramService.sendMessage(ctx.chatId, `✅ Customer updated: ${updated.name} (${updated.phone})`);
+  },
+
+  // ── NEW: /updateproduct ID | SellingPrice? | PurchasePrice? | Status? ──
+  async cmdUpdateProduct(ctx: CommandContext, raw: string, lang: string) {
+    if (!this.can(ctx, "products:update")) return this.deny(ctx, lang);
+    const [id, sellStr, purchaseStr, status] = raw.split("|").map((s: string) => s.trim());
+    if (!id) return TelegramService.sendMessage(ctx.chatId, "Usage: /updateproduct ID | SellingPrice? | PurchasePrice? | Status?\n\nStatus: ACTIVE | INACTIVE");
+    const existing = await db.product.findUnique({ where: { id } });
+    if (!existing) return TelegramService.sendMessage(ctx.chatId, "❌ Product not found.");
+    const data: any = {};
+    if (sellStr) data.sellingPrice = Number(sellStr);
+    if (purchaseStr) data.purchasePrice = Number(purchaseStr);
+    if (status) data.status = status.toUpperCase();
+    await db.product.update({ where: { id }, data });
+    // Push price/status update to WooCommerce (fire-and-forget).
+    if (existing.externalId && (data.sellingPrice !== undefined || data.status !== undefined)) {
+      const { WooCommerceService } = await import("./woocommerce");
+      void WooCommerceService.pushProductUpdate(id, { sellingPrice: data.sellingPrice, status: data.status }).catch(() => {});
+    }
+    await TelegramService.sendMessage(ctx.chatId, `✅ Product updated: ${existing.name} (${existing.sku})`);
+  },
+
+  // ── NEW: /updatecategory ID | Name? | Description? ──
+  async cmdUpdateCategory(ctx: CommandContext, raw: string, lang: string) {
+    if (!this.can(ctx, "categories:update")) return this.deny(ctx, lang);
+    const [id, name, description] = raw.split("|").map((s: string) => s.trim());
+    if (!id) return TelegramService.sendMessage(ctx.chatId, "Usage: /updatecategory ID | Name? | Description?");
+    const existing = await db.category.findUnique({ where: { id } });
+    if (!existing) return TelegramService.sendMessage(ctx.chatId, "❌ Category not found.");
+    const data: any = {};
+    if (name) data.name = name;
+    if (description) data.description = description;
+    await db.category.update({ where: { id }, data });
+    await TelegramService.sendMessage(ctx.chatId, `✅ Category updated: ${existing.name}`);
+  },
+
+  // ── NEW: /updatesupplier ID | Name? | Phone? | Email? | Address? ──
+  async cmdUpdateSupplier(ctx: CommandContext, raw: string, lang: string) {
+    if (!this.can(ctx, "suppliers:update")) return this.deny(ctx, lang);
+    const [id, name, phone, email, address] = raw.split("|").map((s: string) => s.trim());
+    if (!id) return TelegramService.sendMessage(ctx.chatId, "Usage: /updatesupplier ID | Name? | Phone? | Email? | Address?");
+    const existing = await db.supplier.findUnique({ where: { id } });
+    if (!existing) return TelegramService.sendMessage(ctx.chatId, "❌ Supplier not found.");
+    const data: any = {};
+    if (name) data.name = name;
+    if (phone) data.phone = phone;
+    if (email) data.email = email;
+    if (address) data.address = address;
+    await db.supplier.update({ where: { id }, data });
+    await TelegramService.sendMessage(ctx.chatId, `✅ Supplier updated: ${existing.name}`);
+  },
+
+  // ── NEW: /createpurchase SupplierID | SKU:QTY:COST,SKU:QTY:COST | PaidAmount? | ShippingCost? ──
+  async cmdCreatePurchase(ctx: CommandContext, raw: string, lang: string) {
+    if (!this.can(ctx, "purchases:create")) return this.deny(ctx, lang);
+    const parts = raw.split("|").map((s: string) => s.trim());
+    if (parts.length < 2) {
+      return TelegramService.sendMessage(ctx.chatId,
+        "Usage: /createpurchase SupplierID | SKU:QTY:COST,SKU:QTY:COST | PaidAmount? | ShippingCost?\n\n" +
+        "Example: /createpurchase SUP-1001 | IPH13:10:95000,IPHCASE:50:120 | 500000 | 2000"
+      );
+    }
+    const [supplierId, itemsRaw, paidStr, shippingStr] = parts;
+    const supplier = await db.supplier.findUnique({ where: { id: supplierId } });
+    if (!supplier) return TelegramService.sendMessage(ctx.chatId, "❌ Supplier not found.");
+    // Parse items: "SKU:QTY:COST,SKU:QTY:COST"
+    const items: { productId: string; quantity: number; unitCost?: number }[] = [];
+    for (const pair of itemsRaw.split(",").map((s: string) => s.trim())) {
+      const [sku, qtyStr, costStr] = pair.split(":").map((s: string) => s.trim());
+      const product = await db.product.findUnique({ where: { sku } });
+      if (!product) return TelegramService.sendMessage(ctx.chatId, `❌ Product not found: ${sku}`);
+      const qty = Number(qtyStr);
+      if (!Number.isFinite(qty) || qty <= 0) return TelegramService.sendMessage(ctx.chatId, `❌ Invalid quantity for ${sku}: ${qtyStr}`);
+      items.push({ productId: product.id, quantity: qty, unitCost: costStr ? Number(costStr) : undefined });
+    }
+    try {
+      const purchase = await PurchaseService.create({
+        supplierId: supplier.id,
+        items,
+        paidAmount: paidStr ? Number(paidStr) : 0,
+        shippingCost: shippingStr ? Number(shippingStr) : 0,
+        receive: true,
+        createdBy: ctx.user?.id,
+      } as any);
+      await TelegramService.sendMessage(ctx.chatId,
+        `✅ Purchase created: <b>${(purchase as any)?.purchaseNumber ?? "—"}</b>\n` +
+        `Total: ${money(Number((purchase as any)?.total ?? 0).toFixed(2))}\n` +
+        `Paid: ${money(Number((purchase as any)?.paidAmount ?? 0).toFixed(2))}\n` +
+        `Due: ${money(Number((purchase as any)?.dueAmount ?? 0).toFixed(2))}\n` +
+        `Stock received + WAC recomputed.`
+      );
+    } catch (e) {
+      await TelegramService.sendMessage(ctx.chatId, `❌ ${(e as Error).message}`);
+    }
+  },
+
+  // ── NEW: /receivepurchase PurchaseID ──
+  async cmdReceivePurchase(ctx: CommandContext, args: string[], lang: string) {
+    if (!this.can(ctx, "purchases:update")) return this.deny(ctx, lang);
+    const purchaseId = args[0]?.trim();
+    if (!purchaseId) return TelegramService.sendMessage(ctx.chatId, "Usage: /receivepurchase PurchaseID\n\nReceives a pending purchase — increases stock + recomputes WAC.");
+    try {
+      await PurchaseService.receive(purchaseId);
+      await TelegramService.sendMessage(ctx.chatId, `✅ Purchase ${purchaseId} received. Stock increased + WAC recomputed.`);
+    } catch (e) {
+      await TelegramService.sendMessage(ctx.chatId, `❌ ${(e as Error).message}`);
+    }
   },
 
   async cmdCash(ctx: CommandContext, _args: string[], lang: string) {

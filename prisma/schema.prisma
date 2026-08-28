@@ -1094,6 +1094,11 @@ model ProductVariant {
   attributes  String?  // JSON: {color, size, ...}
   purchasePrice Float @default(0)
   sellingPrice Float @default(0)
+  stock       Float  @default(0)  // variant-level stock (separate from product-level)
+  imageUrl    String?  // variant image (WooCommerce variation image)
+  // WooCommerce variation id — sparse unique so duplicate webhook deliveries
+  // don't create two variant rows for the same Woo variation.
+  externalId  String?  @unique
   isActive    Boolean  @default(true)
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt

@@ -7,6 +7,18 @@ import { AuditService } from "./audit";
 // PaymentService — single source for payment recording & payment status calculation.
 // Payment status is ALWAYS recomputed from actual payment records, never trusted
 // from the frontend.
+//
+// INTEGRITY GUARDS:
+//   1. Rejects payments on CANCELLED or REFUNDED orders (terminal states —
+//      no further financial activity is permitted).
+//   2. Rejects payments on RETURN_REQUESTED orders (the return flow must
+//      complete first).
+//   3. Prevents overpayment (cumulative paid + new amount ≤ order total).
+//   4. Idempotent on `transactionReference` — if the same reference (e.g.
+//      a bKash trxId) is submitted twice, the second submission returns
+//      the existing payment record instead of creating a duplicate.
+//   5. Audit log fires inside the transaction (rolls back together).
+//   6. PAYMENT_RECEIVED automation + Telegram routing fire post-commit.
 export const PaymentService = {
   async create(input: {
     orderId: string;
@@ -18,13 +30,37 @@ export const PaymentService = {
   }) {
     // Capture order context for the post-commit automation trigger.
     let orderCtx = { id: input.orderId, orderNumber: "", total: new Prisma.Decimal(0) };
+
+    // ── Idempotency: if a transactionReference is provided, check for an
+    // existing payment with the same reference BEFORE opening a transaction.
+    // This prevents duplicate payments from webhook redeliveries, double-
+    // clicks, or retry logic. Returns the existing record instead of creating
+    // a duplicate.
+    if (input.transactionReference && input.transactionReference.trim() !== "") {
+      const existing = await db.payment.findFirst({
+        where: { orderId: input.orderId, transactionReference: input.transactionReference },
+      });
+      if (existing) return existing;
+    }
+
     return db.$transaction(async (tx) => {
       const user = await getCurrentUser();
       const createdBy = input.createdBy ?? user?.id;
 
       const order = await tx.order.findUnique({ where: { id: input.orderId } });
       if (!order) throw new Error("Order not found");
-      orderCtx = { id: order.id, orderNumber: order.orderNumber, total: order.total };
+      orderCtx = { id: order.id, orderNumber: order.orderNumber, total: toDecimal(order.total) };
+
+      // Reject payments on terminal / pending-return states.
+      // - CANCELLED: the order is dead — no money should change hands.
+      // - REFUNDED: the order is fully refunded — additional payments make
+      //   no sense; if the customer is re-purchasing, create a NEW order.
+      // - RETURN_REQUESTED: the return flow must complete (RETURNED →
+      //   optionally REFUNDED) before any new payment is accepted.
+      const rejectedStatuses = ["CANCELLED", "REFUNDED", "RETURN_REQUESTED"];
+      if (rejectedStatuses.includes(order.status)) {
+        throw new Error(`Cannot record payment on order with status ${order.status}.`);
+      }
 
       const amount = toDecimal(input.amount);
       if (amount.lte(0)) throw new Error("Payment amount must be positive");
@@ -43,11 +79,22 @@ export const PaymentService = {
         );
       }
 
+      // Re-check idempotency INSIDE the transaction (the pre-tx check above
+      // is a TOCTOU optimisation; this is the authoritative check that
+      // prevents races between two concurrent submissions of the same ref).
+      if (input.transactionReference && input.transactionReference.trim() !== "") {
+        const existingInTx = await tx.payment.findFirst({
+          where: { orderId: order.id, transactionReference: input.transactionReference },
+        });
+        if (existingInTx) return existingInTx;
+      }
+
       const payment = await tx.payment.create({
         data: {
           orderId: order.id,
           customerId: order.customerId,
-          amount,
+          // Schema stores Float — convert Decimal via toNumber().
+          amount: amount.toNumber(),
           method: input.method,
           transactionReference: input.transactionReference,
           notes: input.notes,
@@ -62,7 +109,7 @@ export const PaymentService = {
 
       await tx.order.update({
         where: { id: order.id },
-        data: { paidAmount: newPaid, paymentStatus: status },
+        data: { paidAmount: newPaid.toNumber(), paymentStatus: status },
       });
 
       await AuditService.log({
@@ -70,7 +117,7 @@ export const PaymentService = {
         action: "PAYMENT_CREATE",
         entity: "Payment",
         entityId: payment.id,
-        changes: { orderId: order.id, amount: amount.toFixed(2), method: input.method },
+        changes: { orderId: order.id, amount: amount.toFixed(2), method: input.method, transactionReference: input.transactionReference },
       }, tx);
 
       return payment;

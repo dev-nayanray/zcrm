@@ -4,12 +4,20 @@ import { toDecimal } from "@/lib/decimal";
 import { InventoryService } from "./inventory";
 import { AuditService } from "./audit";
 import { getCurrentUser } from "@/lib/auth";
+import { ProfitabilityService } from "./profitability";
 
 // DeliveryService — manages order deliveries and the courier abstraction.
 // Delivery statuses: PENDING|PACKED|SHIPPED|IN_TRANSIT|DELIVERED|FAILED|RETURNED
 // When a delivery is marked DELIVERED, the underlying order is also moved to
 // DELIVERED — which triggers OrderService's reservation→SALE conversion via
 // the same InventoryService (no duplicate logic).
+//
+// COST TRACKING (Phase 3):
+//   deliveryCharge     = shipping INCOME (what customer paid; mirrors Order.shippingCost)
+//   actualCourierCost  = real courier COST (what courier charged us)
+//   returnCharge       = extra cost if parcel was returned to sender
+//   collectedAmount    = what courier actually collected (may differ from codAmount)
+// Shipping Profit = deliveryCharge − actualCourierCost (reflected in order net profit)
 export const DeliveryService = {
   async list(opts: { page: number; limit: number; status?: string; search?: string; courierProviderId?: string }) {
     const where: Prisma.DeliveryWhereInput = {};
@@ -60,7 +68,10 @@ export const DeliveryService = {
     courierName?: string;
     trackingNumber?: string;
     deliveryCharge?: Prisma.Decimal | number | string;
+    actualCourierCost?: Prisma.Decimal | number | string;
+    returnCharge?: Prisma.Decimal | number | string;
     codAmount?: Prisma.Decimal | number | string;
+    collectedAmount?: Prisma.Decimal | number | string;
     recipientName?: string;
     recipientPhone?: string;
     recipientAddress?: string;
@@ -83,8 +94,11 @@ export const DeliveryService = {
           courierProviderId: input.courierProviderId ?? null,
           courierName: input.courierName,
           trackingNumber: input.trackingNumber,
-          deliveryCharge: toDecimal(input.deliveryCharge ?? order.shippingCost),
-          codAmount: toDecimal(input.codAmount ?? order.total),
+          deliveryCharge: toDecimal(input.deliveryCharge ?? order.shippingCost).toNumber(),
+          actualCourierCost: toDecimal(input.actualCourierCost ?? 0).toNumber(),
+          returnCharge: toDecimal(input.returnCharge ?? 0).toNumber(),
+          codAmount: toDecimal(input.codAmount ?? order.total).toNumber(),
+          collectedAmount: toDecimal(input.collectedAmount ?? 0).toNumber(),
           status: input.autoShip ? "SHIPPED" : "PENDING",
           recipientName: input.recipientName ?? order.customer?.name,
           recipientPhone: input.recipientPhone ?? order.customer?.phone,
@@ -120,7 +134,12 @@ export const DeliveryService = {
         }
       }
 
-      await AuditService.log({ userId: createdBy, action: "DELIVERY_CREATE", entity: "Delivery", entityId: delivery.id, changes: { orderId: order.id } }, tx);
+      await AuditService.log({ userId: createdBy, action: "DELIVERY_CREATE", entity: "Delivery", entityId: delivery.id, changes: { orderId: order.id, actualCourierCost: toDecimal(input.actualCourierCost ?? 0).toFixed(2) } }, tx);
+
+      // Re-persist the order's profitability snapshot — actualCourierCost
+      // and returnCharge affect net profit.
+      await ProfitabilityService.persistSnapshot(order.id, tx);
+
       return tx.delivery.findUnique({ where: { id: delivery.id }, include: { order: true, courierProvider: true, statusHistory: true } });
     }, { timeout: 20000, maxWait: 10000 });
   },
