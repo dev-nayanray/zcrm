@@ -142,6 +142,19 @@ export const TelegramCommandService = {
       "/users": this.cmdUsers, "/categories": this.cmdCategories, "/couriers": this.cmdCouriers,
       "/automation": this.cmdAutomation, "/templates": this.cmdTemplates, "/wallet": this.cmdWallet,
       "/auditlogs": this.cmdAuditLogs,
+      // ── NEW: report variants (req'd by the user spec) ──
+      "/salesreport": this.cmdSalesReport, "/profitreport": this.cmdProfitReport,
+      "/expensereport": this.cmdExpenseReport, "/inventoryreport": this.cmdInventoryReport,
+      "/paymentreport": this.cmdPaymentReport, "/orderreport": this.cmdOrderReport,
+      "/purchasereport": this.cmdPurchaseReport,
+      // ── NEW: refunds & supplier payments ──
+      "/refunds": this.cmdRefunds,
+      "/receivepayment": this.cmdReceivePayment,
+      // ── NEW: low-stock & stock adjust shortcuts ──
+      "/lowstock": this.cmdLowStock,
+      "/stockadjust": this.cmdStockAdjustShortcut,
+      // ── NEW: today / summary / dashboard ──
+      "/today": this.cmdToday, "/summary": this.cmdSummary, "/dashboard": this.cmdDashboard,
     };
 
     // Commands that take raw "|"-separated text after the command (not the
@@ -154,6 +167,11 @@ export const TelegramCommandService = {
       "/addexpense": this.cmdAddExpense,
       "/addproduct": this.cmdAddProduct,
       "/transfer": this.cmdCreateTransfer,
+      // ── NEW: create order from raw text ──
+      "/createorder": this.cmdCreateOrder,
+      "/updateorder": this.cmdUpdateOrder,
+      "/cancelorder": this.cmdCancelOrder,
+      "/returnorder": this.cmdReturnOrder,
     };
     if (rawTextCommands[command]) {
       try {
@@ -453,6 +471,10 @@ export const TelegramCommandService = {
 
       case "auditlogs_page": return this.paginateAuditLogs(ctx, Number(params[0]) || 1, messageId, lang);
 
+      // ── NEW: reports menu callback — opens a list of report types ──
+      case "reports_menu": return this.reportsMenu(ctx, messageId, lang);
+      case "reports_view": return this.viewReport(ctx, params[0] || "profit-loss", messageId, lang);
+
       default:
         await TelegramService.sendMessage(ctx.chatId, this.t("unknownAction", lang));
     }
@@ -511,13 +533,13 @@ export const TelegramCommandService = {
     const isAdmin = ctx.roleName === "SUPER_ADMIN" || ctx.roleName === "ADMIN";
     const rows: any[][] = [];
     const can = (p: string) => isAdmin || perms.includes(p);
-    if (can("orders:read")) rows.push([btn("📦 Orders", "orders_page:1"), btn("🚚 Deliveries", "menu")]);
+    if (can("orders:read")) rows.push([btn("📦 Orders", "orders_page:1"), btn("🚚 Deliveries", "deliveries_page:1")]);
     if (can("customers:read")) rows.push([btn("👥 Customers", "customers_page:1"), btn("💸 Due", "due_page:1")]);
-    if (can("inventory:read")) rows.push([btn("📊 Inventory", "inventory_page:1"), btn("🔄 Movements", "menu")]);
+    if (can("inventory:read")) rows.push([btn("📊 Inventory", "inventory_page:1"), btn("🔄 Movements", "movements_page:1")]);
     if (can("payments:read")) rows.push([btn("💰 Payments", "payments_page:1")]);
     if (can("leads:read")) rows.push([btn("🎯 Leads", "leads_page:1")]);
     if (can("stock_counts:read")) rows.push([btn("📋 Stock Count", "stockcount_page:1")]);
-    if (can("reports:read")) rows.push([btn("📈 Reports", "menu")]);
+    if (can("reports:read")) rows.push([btn("📈 Reports", "reports_menu")]);
     if (can("users:read")) rows.push([btn("🧑‍💼 Users", "users_page:1")]);
     rows.push([btn("❓ Help", "help")]);
     return { inline_keyboard: rows };
@@ -563,6 +585,17 @@ export const TelegramCommandService = {
     if (can("message_templates:read")) cmds.push("/templates — message templates");
     if (can("billing:read")) cmds.push("/wallet — your billing & wallet summary");
     if (can("audit_logs:read")) cmds.push("/auditlogs — recent audit log activity");
+    // NEW commands
+    if (can("dashboard:read") || can("reports:read")) cmds.push("/today /summary /dashboard — today's KPIs");
+    if (can("orders:create")) cmds.push("/createorder PHONE | SKU:QTY,SKU:QTY | METHOD | SHIPPING — create an order");
+    if (can("orders:update")) cmds.push("/updateorder ORDER_ID | STATUS — change order status");
+    if (can("orders:cancel")) cmds.push("/cancelorder ORDER_ID — cancel order & restore stock");
+    if (can("returns:create")) cmds.push("/returnorder ORDER_ID | TYPE? | REASON? — start a return");
+    if (can("payments:create")) cmds.push("/receivepayment ORDER_ID | AMOUNT | METHOD | REF? — record payment");
+    if (can("inventory:read")) cmds.push("/lowstock — low/out-of-stock items");
+    if (can("inventory:adjust")) cmds.push("/stockadjust PRODUCT_ID | NEW_QTY | REASON? — set stock");
+    if (can("refunds:read")) cmds.push("/refunds — recent refunds");
+    if (can("reports:read")) cmds.push("/salesreport /profitreport /expensereport /inventoryreport /paymentreport /orderreport /purchasereport — quick reports");
     const text = `<b>Z-CRM Bot Commands</b>\n\nRole: <b>${ctx.roleName}</b>\nGroup: ${ctx.group.chatTitle}\n\n${cmds.map((c) => "• " + c).join("\n")}`;
     await TelegramService.sendMessage(ctx.chatId, text);
   },
@@ -1037,6 +1070,319 @@ export const TelegramCommandService = {
     const pnl = await AccountingService.profitAndLoss();
     const text = `<b>📈 P&L Summary</b>\n\nRevenue: ${money(pnl.revenue.toFixed(2))}\nCOGS: ${money(pnl.cogs.toFixed(2))}\nGross Profit: ${money(pnl.grossProfit.toFixed(2))}\nExpenses: ${money(pnl.operatingExpenses.toFixed(2))}\nNet Profit: ${money(pnl.netProfit.toFixed(2))}\nOrders: ${pnl.orderCount}`;
     await TelegramService.sendMessage(ctx.chatId, text);
+  },
+
+  // ────────────────────────────────────────────────────────────────
+  // NEW: Reports menu + per-report commands.
+  // ────────────────────────────────────────────────────────────────
+  async reportsMenu(ctx: CommandContext, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "reports:read")) return this.deny(ctx, lang);
+    const btn = (label: string, type: string) => ({ text: label, callback_data: `reports_view:${type}` });
+    const kb = {
+      inline_keyboard: [
+        [btn("📈 Profit & Loss", "profit-loss")],
+        [btn("💰 Sales Report", "sales"), btn("💳 Payment Report", "payments")],
+        [btn("📉 Expense Report", "expenses"), btn("📦 Inventory Report", "inventory")],
+        [btn("🛍 Products Report", "products"), btn("👥 Customers Report", "customers")],
+        [btn("🚚 Channel Report", "channels"), btn("💵 Cash Flow", "cash-flow")],
+        [btn("← Back", "menu")],
+      ],
+    };
+    const text = "<b>📈 Reports</b>\nSelect a report type:";
+    if (messageId) await TelegramService.editMessage(ctx.chatId, messageId, text, kb);
+    else await TelegramService.sendMessage(ctx.chatId, text, kb);
+  },
+
+  async viewReport(ctx: CommandContext, type: string, messageId: number | undefined, _lang: string) {
+    if (!this.can(ctx, "reports:read")) return this.deny(ctx, _lang);
+    const text = await this.renderReport(type);
+    const kb = { inline_keyboard: [[{ text: "← Back", callback_data: "reports_menu" }]] };
+    if (messageId) await TelegramService.editMessage(ctx.chatId, messageId, text, kb);
+    else await TelegramService.sendMessage(ctx.chatId, text, kb);
+  },
+
+  // Shared renderer used by both the inline-button flow and the
+  // /salesreport /profitreport /expensereport /inventoryreport
+  // /paymentreport /orderreport /purchasereport command aliases.
+  async renderReport(type: string): Promise<string> {
+    switch (type) {
+      case "profit-loss": {
+        const pnl = await AccountingService.profitAndLoss();
+        return `<b>📈 P&L Summary</b>\n\nRevenue: ${money(pnl.revenue.toFixed(2))}\nCOGS: ${money(pnl.cogs.toFixed(2))}\nGross Profit: ${money(pnl.grossProfit.toFixed(2))}\nOperating Expenses: ${money(pnl.operatingExpenses.toFixed(2))}\nNet Profit: ${money(pnl.netProfit.toFixed(2))}\nOrders: ${pnl.orderCount}`;
+      }
+      case "sales": {
+        // trend(days) returns [{ date, sales: string, expenses: string, orders }]
+        const s = await AccountingService.trend(30);
+        const lines = s.map((d: any) => `${d.date}: ${money(d.sales ?? "0")} (${d.orders ?? 0} orders)`).join("\n");
+        return `<b>💰 Sales — last 30 days</b>\n\n${lines || "No sales"}`;
+      }
+      case "payments": {
+        // paymentStats() returns [{ method, total: string, count: number }]
+        const rows = await AccountingService.paymentStats();
+        const totalReceived = rows.reduce((s: number, r: any) => s + Number(r.total ?? 0), 0);
+        const lines = rows.map((r: any) => `  ${r.method}: ${money(r.total)} (${r.count} txns)`).join("\n");
+        return `<b>💳 Payment Report</b>\n\nTotal Received: ${money(totalReceived.toFixed(2))}\nBy Method:\n${lines || "No payments"}`;
+      }
+      case "expenses": {
+        const byCat = await AccountingService.expenseByCategory();
+        const lines = byCat.map((c: any) => `${c.category}: ${money(c.total)} (${c.count})`).join("\n");
+        return `<b>📉 Expenses by Category</b>\n\n${lines || "No expenses"}`;
+      }
+      case "inventory": {
+        const items = await db.inventory.findMany({ include: { product: true }, take: 20, orderBy: { quantity: "asc" } });
+        const lines = items.map((i: any) => `${i.product?.name ?? "—"} (${i.product?.sku ?? "—"}): ${i.quantity} (min ${i.minimumStock})`).join("\n");
+        return `<b>📦 Inventory — 20 lowest-stock items</b>\n\n${lines || "No inventory"}`;
+      }
+      case "products": {
+        // topProducts(range, limit) returns [{ productId, name, sku, quantity, revenue, cogs, profit }]
+        const top = await AccountingService.topProducts(undefined, 10);
+        const lines = top.map((p: any, i: number) => `${i + 1}. ${p.name} — ${p.quantity} sold · ${money(p.revenue)}`).join("\n");
+        return `<b>🛍 Top 10 Products</b>\n\n${lines || "No data"}`;
+      }
+      case "customers": {
+        const top = await db.customer.findMany({ take: 10, orderBy: { createdAt: "desc" }, include: { orders: true } });
+        const lines = top.map((c: any) => `${c.name} — ${c.orders.length} orders`).join("\n");
+        return `<b>👥 Recent Customers</b>\n\n${lines || "No customers"}`;
+      }
+      case "channels": {
+        // salesByChannel() returns [{ name, revenue: string, orders: number }]
+        const ch = await AccountingService.salesByChannel();
+        const lines = ch.map((c: any) => `${c.name}: ${money(c.revenue)} (${c.orders} orders)`).join("\n");
+        return `<b>🚚 Sales by Channel</b>\n\n${lines || "No data"}`;
+      }
+      case "cash-flow": {
+        const cs: any = await CashService.summary();
+        const num = (v: any) => Number(v ?? 0).toFixed(2);
+        return `<b>💵 Cash Flow</b>\n\nOpening: ${money(num(cs.openingBalance))}\n+ Cash Sales: ${money(num(cs.cashSales))}\n+ Customer Payments: ${money(num(cs.customerPayments))}\n− Refunds: ${money(num(cs.refunds))}\n− Expenses: ${money(num(cs.expenses))}\n= Closing: ${money(num(cs.closingBalance))}`;
+      }
+      default:
+        return "❌ Unknown report type. Use the reports menu.";
+    }
+  },
+
+  // Per-report command aliases (so users can type /salesreport etc.).
+  async cmdSalesReport(ctx: CommandContext, _args: string[], lang: string) {
+    if (!this.can(ctx, "reports:read")) return this.deny(ctx, lang);
+    await TelegramService.sendMessage(ctx.chatId, await this.renderReport("sales"));
+  },
+  async cmdProfitReport(ctx: CommandContext, _args: string[], lang: string) {
+    if (!this.can(ctx, "reports:read")) return this.deny(ctx, lang);
+    await TelegramService.sendMessage(ctx.chatId, await this.renderReport("profit-loss"));
+  },
+  async cmdExpenseReport(ctx: CommandContext, _args: string[], lang: string) {
+    if (!this.can(ctx, "reports:read")) return this.deny(ctx, lang);
+    await TelegramService.sendMessage(ctx.chatId, await this.renderReport("expenses"));
+  },
+  async cmdInventoryReport(ctx: CommandContext, _args: string[], lang: string) {
+    if (!this.can(ctx, "reports:read")) return this.deny(ctx, lang);
+    await TelegramService.sendMessage(ctx.chatId, await this.renderReport("inventory"));
+  },
+  async cmdPaymentReport(ctx: CommandContext, _args: string[], lang: string) {
+    if (!this.can(ctx, "reports:read")) return this.deny(ctx, lang);
+    await TelegramService.sendMessage(ctx.chatId, await this.renderReport("payments"));
+  },
+  async cmdOrderReport(ctx: CommandContext, _args: string[], lang: string) {
+    if (!this.can(ctx, "reports:read")) return this.deny(ctx, lang);
+    const count = await db.order.count();
+    const byStatus = await db.order.groupBy({ by: ["status"], _count: true });
+    const lines = byStatus.map((s: any) => `${s.status}: ${s._count}`).join("\n");
+    await TelegramService.sendMessage(ctx.chatId, `<b>📋 Order Report</b>\n\nTotal: ${count}\n\n${lines}`);
+  },
+  async cmdPurchaseReport(ctx: CommandContext, _args: string[], lang: string) {
+    if (!this.can(ctx, "reports:read")) return this.deny(ctx, lang);
+    const count = await db.purchase.count();
+    const byStatus = await db.purchase.groupBy({ by: ["status"], _count: true });
+    const lines = byStatus.map((s: any) => `${s.status}: ${s._count}`).join("\n");
+    await TelegramService.sendMessage(ctx.chatId, `<b>🛒 Purchase Report</b>\n\nTotal: ${count}\n\n${lines}`);
+  },
+
+  // ────────────────────────────────────────────────────────────────
+  // NEW: /refunds, /receivepayment, /lowstock, /stockadjust
+  // ────────────────────────────────────────────────────────────────
+  async cmdRefunds(ctx: CommandContext, _args: string[], lang: string) {
+    if (!this.can(ctx, "refunds:read")) return this.deny(ctx, lang);
+    const refunds = await db.refund.findMany({ take: 10, orderBy: { createdAt: "desc" }, include: { order: true } });
+    if (!refunds.length) return TelegramService.sendMessage(ctx.chatId, "📭 No refunds found.");
+    const lines = refunds.map((r: any) => `#${r.order?.orderNumber ?? "—"} — ${money(r.amount.toFixed(2))} (${r.method}) — ${r.notes ?? ""}`).join("\n");
+    await TelegramService.sendMessage(ctx.chatId, `<b>💸 Recent Refunds</b>\n\n${lines}`);
+  },
+
+  async cmdReceivePayment(ctx: CommandContext, args: string[], lang: string) {
+    if (!this.can(ctx, "payments:create")) return this.deny(ctx, lang);
+    // /receivepayment ORDER_ID|AMOUNT|METHOD|REFERENCE?
+    const [orderId, amountStr, method, ref] = args.join(" ").split("|").map((s: string) => s.trim());
+    if (!orderId || !amountStr || !method) {
+      return TelegramService.sendMessage(ctx.chatId, "Usage: /receivepayment ORDER_ID | AMOUNT | METHOD | REFERENCE?\n\nMETHOD: CASH, BKASH, NAGAD, BANK, CARD, OTHER");
+    }
+    const amount = Number(amountStr);
+    if (!Number.isFinite(amount) || amount <= 0) return TelegramService.sendMessage(ctx.chatId, "❌ Invalid amount.");
+    const order = await db.order.findUnique({ where: { id: orderId } });
+    if (!order) return TelegramService.sendMessage(ctx.chatId, "❌ Order not found. Use the order ID (not the order number).");
+    await db.payment.create({
+      data: { orderId: order.id, customerId: order.customerId, amount, method: method.toUpperCase(), transactionReference: ref ?? null, createdBy: ctx.user?.id },
+    });
+    // Recompute payment status (idempotent)
+    await OrderService.recomputePaymentStatus(order.id);
+    await TelegramService.sendMessage(ctx.chatId, `✅ Payment of ${money(amount.toFixed(2))} recorded for order ${order.orderNumber}.`);
+  },
+
+  async cmdLowStock(ctx: CommandContext, _args: string[], lang: string) {
+    if (!this.can(ctx, "inventory:read")) return this.deny(ctx, lang);
+    const items = await db.inventory.findMany({
+      where: { OR: [{ quantity: { lte: 0 } }, { reservedQuantity: { gt: 0 } }] },
+      include: { product: true },
+      take: 30,
+    });
+    // Also include items where available <= minimumStock
+    const low = items.filter((i: any) => {
+      const avail = (i.quantity ?? 0) - (i.reservedQuantity ?? 0);
+      return avail <= (i.minimumStock ?? 0);
+    });
+    if (!low.length) return TelegramService.sendMessage(ctx.chatId, "✅ No low-stock items.");
+    const lines = low.map((i: any) => `🔴 ${i.product?.name ?? "—"} (${i.product?.sku ?? "—"}): ${i.quantity - i.reservedQuantity} available`).join("\n");
+    await TelegramService.sendMessage(ctx.chatId, `<b>⚠️ Low Stock</b>\n\n${lines}`);
+  },
+
+  async cmdStockAdjustShortcut(ctx: CommandContext, args: string[], lang: string) {
+    if (!this.can(ctx, "inventory:adjust")) return this.deny(ctx, lang);
+    // /stockadjust PRODUCT_ID|NEW_QTY|REASON?
+    const [productId, qtyStr, reason] = args.join(" ").split("|").map((s: string) => s.trim());
+    if (!productId || !qtyStr) return TelegramService.sendMessage(ctx.chatId, "Usage: /stockadjust PRODUCT_ID | NEW_QTY | REASON?");
+    const newQty = Number(qtyStr);
+    if (!Number.isFinite(newQty)) return TelegramService.sendMessage(ctx.chatId, "❌ Invalid quantity.");
+    const inv = await db.inventory.findUnique({ where: { productId } });
+    if (!inv) return TelegramService.sendMessage(ctx.chatId, "❌ Inventory not found for that product.");
+    const delta = newQty - (inv.quantity as number);
+    await InventoryService.applyMovement({
+      productId,
+      type: "ADJUSTMENT",
+      quantityChange: delta,
+      referenceType: "MANUAL",
+      reason: reason || `Telegram adjust to ${newQty}`,
+      createdBy: ctx.user?.id,
+    });
+    await TelegramService.sendMessage(ctx.chatId, `✅ Stock adjusted. New quantity: ${newQty}`);
+  },
+
+  // ────────────────────────────────────────────────────────────────
+  // NEW: /today /summary /dashboard — quick KPI snapshots
+  // ────────────────────────────────────────────────────────────────
+  async cmdToday(ctx: CommandContext, _args: string[], lang: string) {
+    if (!this.can(ctx, "dashboard:read") && !this.can(ctx, "reports:read")) return this.deny(ctx, lang);
+    const start = new Date();
+    start.setHours(0, 0, 0, 0);
+    const end = new Date();
+    end.setHours(23, 59, 59, 999);
+    const [orders, payments, expenses, refunds] = await Promise.all([
+      db.order.findMany({ where: { createdAt: { gte: start, lte: end }, status: { not: "CANCELLED" } } }),
+      db.payment.findMany({ where: { createdAt: { gte: start, lte: end } } }),
+      db.expense.findMany({ where: { expenseDate: { gte: start, lte: end } } }),
+      db.refund.findMany({ where: { createdAt: { gte: start, lte: end } } }),
+    ]);
+    const revenue = orders.reduce((s: number, o: any) => s + (o.total ?? 0), 0);
+    const cogs = await db.orderItem.aggregate({ where: { order: { createdAt: { gte: start, lte: end }, status: { not: "CANCELLED" } } }, _sum: { unitCost: true } });
+    const paidToday = payments.reduce((s: number, p: any) => s + (p.amount ?? 0), 0);
+    const expToday = expenses.reduce((s: number, e: any) => s + (e.amount ?? 0), 0);
+    const refundedToday = refunds.reduce((s: number, r: any) => s + (r.amount ?? 0), 0);
+    const netProfit = revenue - (cogs._sum.unitCost ?? 0) - expToday - refundedToday;
+    await TelegramService.sendMessage(ctx.chatId, `<b>📊 Today's Summary</b>\n\nOrders: ${orders.length}\nRevenue: ${money(revenue.toFixed(2))}\nCOGS: ${money((cogs._sum.unitCost ?? 0).toFixed(2))}\nPayments Received: ${money(paidToday.toFixed(2))}\nExpenses: ${money(expToday.toFixed(2))}\nRefunds: ${money(refundedToday.toFixed(2))}\nNet Profit: ${money(netProfit.toFixed(2))}`);
+  },
+
+  async cmdSummary(ctx: CommandContext, _args: string[], lang: string) {
+    // Alias for /today
+    return this.cmdToday(ctx, _args, lang);
+  },
+
+  async cmdDashboard(ctx: CommandContext, _args: string[], lang: string) {
+    if (!this.can(ctx, "dashboard:read") && !this.can(ctx, "reports:read")) return this.deny(ctx, lang);
+    const pnl = await AccountingService.profitAndLoss();
+    const lowStock = await db.inventory.count({ where: { OR: [{ quantity: { lte: 0 } }, { reservedQuantity: { gt: 0 } }] } });
+    const pendingOrders = await db.order.count({ where: { status: { in: ["PENDING", "CONFIRMED", "PROCESSING"] } } });
+    await TelegramService.sendMessage(ctx.chatId, `<b>🏠 Dashboard</b>\n\nRevenue: ${money(pnl.revenue.toFixed(2))}\nNet Profit: ${money(pnl.netProfit.toFixed(2))}\nPending Orders: ${pendingOrders}\nLow-Stock Items: ${lowStock}`);
+  },
+
+  // ────────────────────────────────────────────────────────────────
+  // NEW: /createorder, /updateorder, /cancelorder, /returnorder —
+  // raw-pipe commands. Designed for fast one-line order entry from the
+  // phone; the alternative would be a multi-step form which is heavier
+  // to implement.
+  // ────────────────────────────────────────────────────────────────
+  // /createorder PHONE|SKU:QTY,SKU:QTY|PAYMENT_METHOD|SHIPPING?
+  async cmdCreateOrder(ctx: CommandContext, raw: string, lang: string) {
+    if (!this.can(ctx, "orders:create")) return this.deny(ctx, lang);
+    const parts = raw.split("|").map((s: string) => s.trim());
+    if (parts.length < 3) {
+      return TelegramService.sendMessage(ctx.chatId, "Usage: /createorder PHONE | SKU:QTY,SKU:QTY | PAYMENT_METHOD | SHIPPING_COST?\n\nPAYMENT_METHOD: CASH, BKASH, NAGAD, BANK, CARD, OTHER");
+    }
+    const [phone, itemsRaw, method, shippingStr] = parts;
+    if (!phone || !itemsRaw || !method) return TelegramService.sendMessage(ctx.chatId, "❌ Missing phone, items, or payment method.");
+
+    // Resolve customer by phone
+    let customer = await db.customer.findUnique({ where: { phone } });
+    if (!customer) {
+      customer = await db.customer.create({ data: { name: `Customer ${phone}`, phone } });
+    }
+
+    // Parse items: "SKU:QTY,SKU:QTY" → [{ productId, quantity }]
+    const itemPairs = itemsRaw.split(",").map((p: string) => p.trim().split(":")).filter((p: string[]) => p.length === 2);
+    if (!itemPairs.length) return TelegramService.sendMessage(ctx.chatId, "❌ Items must be SKU:QTY,SKU:QTY format.");
+    const items: { productId: string; quantity: number }[] = [];
+    for (const [sku, qtyStr] of itemPairs) {
+      const product = await db.product.findUnique({ where: { sku } });
+      if (!product) return TelegramService.sendMessage(ctx.chatId, `❌ Product not found: ${sku}`);
+      const qty = Number(qtyStr);
+      if (!Number.isFinite(qty) || qty <= 0) return TelegramService.sendMessage(ctx.chatId, `❌ Invalid quantity for ${sku}: ${qtyStr}`);
+      items.push({ productId: product.id, quantity: qty });
+    }
+
+    const shippingCost = shippingStr ? Number(shippingStr) : 0;
+    const order = await OrderService.create({
+      customerId: customer.id,
+      status: "CONFIRMED",
+      shippingCost,
+      items: items.map((i) => ({ productId: i.productId, quantity: i.quantity })),
+      payment: method ? { amount: 0, method: method.toUpperCase() } : undefined,
+      createdBy: ctx.user?.id,
+    } as any);
+    await TelegramService.sendMessage(ctx.chatId, `✅ Order created: <b>${(order as any)?.orderNumber ?? "—"}</b>\nTotal: ${money((order as any)?.total?.toFixed?.(2) ?? "0")}\nCustomer: ${customer.name}`);
+  },
+
+  async cmdUpdateOrder(ctx: CommandContext, raw: string, lang: string) {
+    if (!this.can(ctx, "orders:update")) return this.deny(ctx, lang);
+    const [orderId, status] = raw.split("|").map((s: string) => s.trim());
+    if (!orderId || !status) return TelegramService.sendMessage(ctx.chatId, "Usage: /updateorder ORDER_ID | NEW_STATUS\n\nStatus: PENDING, CONFIRMED, PROCESSING, SHIPPED, DELIVERED, CANCELLED");
+    await OrderService.updateStatus(orderId, status.toUpperCase());
+    await TelegramService.sendMessage(ctx.chatId, `✅ Order ${orderId} → ${status.toUpperCase()}`);
+  },
+
+  async cmdCancelOrder(ctx: CommandContext, raw: string, lang: string) {
+    if (!this.can(ctx, "orders:cancel")) return this.deny(ctx, lang);
+    const orderId = raw.trim();
+    if (!orderId) return TelegramService.sendMessage(ctx.chatId, "Usage: /cancelorder ORDER_ID");
+    await OrderService.updateStatus(orderId, "CANCELLED", "Cancelled via Telegram");
+    await TelegramService.sendMessage(ctx.chatId, `✅ Order ${orderId} cancelled. Stock restored.`);
+  },
+
+  async cmdReturnOrder(ctx: CommandContext, raw: string, lang: string) {
+    if (!this.can(ctx, "returns:create")) return this.deny(ctx, lang);
+    const [orderId, type, reason] = raw.split("|").map((s: string) => s.trim());
+    if (!orderId) return TelegramService.sendMessage(ctx.chatId, "Usage: /returnorder ORDER_ID | TYPE? | REASON?\n\nTYPE: RETURN (default) | EXCHANGE");
+    const order = await db.order.findUnique({ where: { id: orderId }, include: { items: true } });
+    if (!order) return TelegramService.sendMessage(ctx.chatId, "❌ Order not found.");
+    const ret = await db.return.create({
+      data: {
+        orderId: order.id,
+        customerId: order.customerId,
+        status: "PENDING",
+        type: (type || "RETURN").toUpperCase(),
+        reason: reason || "Returned via Telegram",
+        refundAmount: 0,
+        createdBy: ctx.user?.id,
+        items: { create: order.items.map((it: any) => ({ productId: it.productId, quantity: it.quantity, condition: "GOOD" })) },
+      },
+      include: { items: true },
+    });
+    await TelegramService.sendMessage(ctx.chatId, `✅ Return created: <b>${(ret as any).id}</b>\nType: ${ret.type}\nItems: ${ret.items.length}\n\nUse the web dashboard to approve & process stock refund.`);
   },
 
   async cmdCash(ctx: CommandContext, _args: string[], lang: string) {

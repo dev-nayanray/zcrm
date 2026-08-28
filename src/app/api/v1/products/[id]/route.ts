@@ -4,6 +4,7 @@ import { ok, serverError, validationError, notFound, badRequest } from "@/lib/ap
 import { requirePermission, readJsonBody } from "@/lib/guards";
 import { updateProductSchema } from "@/lib/validation";
 import { AuditService } from "@/lib/services/audit";
+import { WooCommerceService } from "@/lib/services/woocommerce";
 
 type Ctx = { params: Promise<{ id: string }> };
 
@@ -67,6 +68,17 @@ export async function PUT(request: NextRequest, ctx: Ctx) {
     }
     const updated = await db.product.update({ where: { id }, data: parsed.data });
     await AuditService.log({ userId: user!.id, action: "PRODUCT_UPDATE", entity: "Product", entityId: id, changes: parsed.data });
+
+    // Push price / status updates back to WooCommerce (fire-and-forget).
+    // Only fires if this product was synced from Woo (has externalId).
+    // Failures are logged to SyncLog, never affect the CRM update.
+    if (existing.externalId && (parsed.data.sellingPrice !== undefined || parsed.data.status !== undefined)) {
+      void WooCommerceService.pushProductUpdate(id, {
+        sellingPrice: parsed.data.sellingPrice,
+        status: parsed.data.status,
+      }).catch(() => {});
+    }
+
     return ok(updated);
   } catch (e) {
     return serverError((e as Error).message);

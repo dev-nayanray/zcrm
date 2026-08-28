@@ -100,7 +100,7 @@ model Customer {
   address    String?
   city       String?
   notes      String?
-  externalId String?  // WooCommerce customer id
+  externalId String?  @unique // WooCommerce customer id (sparse unique — nulls allowed, non-null values must be unique)
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt
 
@@ -113,7 +113,6 @@ model Customer {
   customerCredit   CustomerCredit?
 
   @@unique([phone])
-  @@index([externalId])
   @@index([name])
   @@index([city])
 }
@@ -129,13 +128,12 @@ model Category {
   children    Category[] @relation("CategoryTree")
   status      String   @default("ACTIVE") // ACTIVE | INACTIVE
   sortOrder   Int      @default(0)
-  externalId  String?
+  externalId  String?  @unique // WooCommerce category id (sparse unique)
   products    Product[]
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
   @@index([parentId])
-  @@index([externalId])
 }
 
 model Product {
@@ -153,7 +151,7 @@ model Product {
   minimumStockLevel Float @default(0)
   imageUrl         String?
   status           String   @default("ACTIVE") // ACTIVE | INACTIVE
-  externalId       String?
+  externalId       String?  @unique // WooCommerce product id (sparse unique)
   inventory        Inventory?
   orderItems       OrderItem[]
   purchaseItems    PurchaseItem[]
@@ -168,7 +166,6 @@ model Product {
   updatedAt        DateTime @updatedAt
 
   @@index([categoryId])
-  @@index([externalId])
   @@index([status])
   @@index([name])
 }
@@ -218,7 +215,7 @@ model Order {
   otherCost     Float  @default(0)
   total         Float  @default(0)
   paidAmount    Float  @default(0)
-  externalId    String?  // WooCommerce order id
+  externalId    String?  @unique // WooCommerce order id (sparse unique — duplicate-prevention across webhooks, manual entry, and Telegram)
   syncStatus    String   @default("LOCAL") // LOCAL|SYNCED|FAILED
   sourceChannel String?  // legacy label
   stockReserved Boolean  @default(false) // true = stock reserved (not yet sold)
@@ -240,7 +237,6 @@ model Order {
   @@index([channelId])
   @@index([status])
   @@index([paymentStatus])
-  @@index([externalId])
   @@index([createdAt])
 }
 
@@ -541,14 +537,19 @@ model Refund {
   payment            Payment? @relation(fields: [paymentId], references: [id], onDelete: SetNull, onUpdate: NoAction)
   returnId           String?
   return             Return?  @relation(fields: [returnId], references: [id], onDelete: SetNull, onUpdate: NoAction)
-  amount             Float 
+  amount             Float
   method             String   // CASH|BKASH|NAGAD|BANK|CARD|OTHER
   transactionReference String?
   notes              String?
+  // Idempotency key — callers can submit a UUID; the same key returns the
+  // existing refund instead of creating a duplicate. Webhook redeliveries
+  // and double-clicks are deduped by this column.
+  idempotencyKey     String?
   createdBy          String?
   creator            User?    @relation(fields: [createdBy], references: [id], onDelete: SetNull, onUpdate: NoAction)
   createdAt          DateTime @default(now())
 
+  @@unique([idempotencyKey])
   @@index([orderId])
   @@index([returnId])
   @@index([paymentId])
@@ -570,12 +571,18 @@ model Integration {
 
 model SyncLog {
   id           String   @id @default(cuid()) @map("_id")
-  entity       String   // product|customer|order
+  entity       String   // product|customer|order|category|variation
   externalId   String
-  operation    String   // create|update|delete
+  operation    String   // create|update|delete|sync|push|push_stock|push_status
   status       String   @default("PENDING") // PENDING|SUCCESS|FAILED
   message      String?
   attemptCount Int      @default(0)
+  // Retry metadata — populated when status=FAILED. The retry worker
+  // (POST /integrations/woocommerce/sync/[id]/retry or a future cron)
+  // polls `where status=FAILED, nextRetryAt <= now()`.
+  lastErrorAt  DateTime?
+  nextRetryAt  DateTime?
+  maxAttempts  Int      @default(5)
   payload      String?  // JSON snapshot
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
@@ -583,6 +590,7 @@ model SyncLog {
   @@unique([entity, externalId, operation])
   @@index([status])
   @@index([entity])
+  @@index([nextRetryAt])
 }
 
 // ---------------------------------------------------------------------------

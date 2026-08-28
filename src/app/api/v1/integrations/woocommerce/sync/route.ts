@@ -3,7 +3,7 @@ import { ok, serverError, badRequest } from "@/lib/api";
 import { requirePermission } from "@/lib/guards";
 import { WooCommerceService } from "@/lib/services/woocommerce";
 
-// POST ?entity=products|orders — trigger a bulk sync
+// POST ?entity=products|orders|categories — trigger a bulk sync
 export async function POST(request: NextRequest) {
   try {
     const [, err] = await requirePermission("integrations:sync");
@@ -17,7 +17,11 @@ export async function POST(request: NextRequest) {
       const result = await WooCommerceService.bulkSyncOrders();
       return ok(result);
     }
-    return badRequest("Use ?entity=products or ?entity=orders");
+    if (entity === "categories") {
+      const result = await WooCommerceService.bulkSyncCategories();
+      return ok(result);
+    }
+    return badRequest("Use ?entity=products | orders | categories");
   } catch (e) {
     return serverError((e as Error).message);
   }

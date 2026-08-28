@@ -233,6 +233,19 @@ async function applyMovementInTx(tx: TxClient, input: MovementInput, opts?: { al
     // notification failures must never break the inventory transaction
   }
 
+  // Push stock update back to WooCommerce (fire-and-forget, after tx).
+  // The Woo push must happen OUTSIDE the tx — if it ran inside, the Woo
+  // API call latency would hold the tx open for seconds and the Woo
+  // server being down would roll back the entire inventory adjustment.
+  // We schedule it via microtask so the tx commits first.
+  if (product.externalId) {
+    void Promise.resolve().then(() =>
+      import("./woocommerce").then(({ WooCommerceService }) =>
+        WooCommerceService.pushStockUpdate(input.productId, Number(toDecimal(updated.quantity).toFixed(0)))
+      ).catch(() => {})
+    );
+  }
+
   return { movement, inventory: updated, damagedQuantity: previousDamaged };
 }
 

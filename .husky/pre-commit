@@ -1,7 +1,66 @@
 #!/bin/sh
-# Prevent committing secrets
-if git diff --cached --name-only | xargs grep -lE 'mongodb\+srv://|AUTH_SECRET=[a-f0-9]{32,}' 2>/dev/null; then
-  echo "ERROR: Potential secret detected in staged files."
-  echo "Remove credentials before committing."
-  exit 1
+# Prevent committing secrets.
+#
+# Scans staged files for credential patterns. If any match, the commit is
+# rejected. This catches:
+#   - MongoDB Atlas connection strings (mongodb+srv://...)
+#   - AUTH_SECRET values (32+ hex chars)
+#   - Telegram bot tokens (NNNNNNNNN:AA...)
+#   - WooCommerce consumer secrets (cs_...)
+#   - GitHub personal access tokens (ghp_...)
+#   - Generic password= / secret= / api_key= assignments in .env files
+#
+# Add new patterns here as the integration surface grows.
+
+# Only scan staged files that are tracked text files (skip renames, deletes, binaries).
+FILES=$(git diff --cached --name-only --diff-filter=ACM | grep -vE '\.(png|jpg|jpeg|gif|ico|svg|webp|woff2?|ttf|otf|eot|mp4|webm|pdf|zip|lock)$' | grep -v '^node_modules/' | grep -v '^\.next/')
+if [ -z "$FILES" ]; then
+  exit 0
 fi
+
+# Patterns that indicate a leaked secret. The grep -E alternation matches
+# any of them; the grep -v immediately after excludes the .env.example
+# placeholder values that legitimately live in the repo.
+#
+# Each pattern is anchored to look like an actual secret VALUE, not just a
+# variable assignment. This avoids false positives like
+# `consumer_secret=encodeURIComponent(cfg.consumerSecret)` where the
+# right-hand side is a function call, not a literal secret.
+#
+# Match either:
+#   - quoted strings (single, double, or backtick) containing the pattern,
+#     where the quoted content is the secret value
+#   - or, for env-style assignments, the value must NOT be a JS identifier
+#     (i.e. must contain a character that's not [A-Za-z0-9_.]) so we don't
+#     match `secret=process.env.SECRET` or `secret=cfg.consumerSecret`
+PATTERN='mongodb\+srv://[a-zA-Z0-9._-]+:[^@]+@|[0-9]{8,12}:AA[A-Za-z0-9_-]{30,}|cs_[A-Za-z0-9]{30,}|ghp_[A-Za-z0-9]{30,}|sk_live_[A-Za-z0-9]{20,}|sk_test_[A-Za-z0-9]{20,}|AUTH_SECRET=[a-f0-9]{32,}|password\s*=\s*"[^"]{8,}"|password\s*=\s*'\''[^'\'']{8,}'\''|api[_-]?key\s*=\s*"[^"]{16,}"|api[_-]?key\s*=\s*'\''[^'\'']{16,}'\''|secret\s*=\s*"[^"]{16,}"|secret\s*=\s*'\''[^'\'']{16,}'\'''
+
+# Skip the .env.example file — it intentionally contains placeholder values
+# like mongodb+srv://<username>:<password>@... which would otherwise match.
+FILTERED=$(echo "$FILES" | grep -v '^.env.example$' | grep -v '^docs/mongodb-atlas.md$')
+
+if [ -n "$FILTERED" ]; then
+  if echo "$FILTERED" | xargs grep -nE "$PATTERN" 2>/dev/null; then
+    echo ""
+    echo "ERROR: Potential secret detected in staged files (see matches above)."
+    echo "Remove credentials before committing, or move them to .env (which is gitignored)."
+    echo ""
+    echo "If this is a false positive (e.g. an example/placeholder in a doc),"
+    echo "either reword the example or use 'git commit --no-verify' to bypass."
+    exit 1
+  fi
+fi
+
+# Optional: run lint on staged TS/TSX files only (fast). Commented out by
+# default — it slows down commits. Enable by removing the leading 'if 0;'.
+if 0; then
+  STAGED_TS=$(echo "$FILES" | grep -E '\.(ts|tsx)$' | tr '\n' ' ')
+  if [ -n "$STAGED_TS" ]; then
+    npx eslint $STAGED_TS || {
+      echo "ERROR: ESLint found issues in staged files."
+      exit 1
+    }
+  fi
+fi
+
+exit 0

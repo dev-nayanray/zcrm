@@ -96,7 +96,11 @@ export const BillingService = {
     return db.$transaction(async (tx) => {
       const order = await tx.paymentOrder.findUnique({ where: { id: orderId }, include: { subscription: true } });
       if (!order) throw new Error("Payment order not found");
-      if (order.status === "PAID") throw new Error("Payment already confirmed");
+      // Guard: only PENDING orders can be confirmed. Previously this only
+      // blocked re-confirming PAID orders, leaving FAILED/CANCELLED/REFUNDED
+      // orders re-confirmable — a footgun for gateway callbacks arriving
+      // out of order.
+      if (order.status !== "PENDING") throw new Error(`Payment cannot be confirmed — current status: ${order.status}`);
 
       await tx.paymentOrder.update({
         where: { id: orderId },
@@ -118,28 +122,31 @@ export const BillingService = {
         });
       }
 
-      // Add to wallet if method is WALLET — deduct from balance
+      // Add to wallet if method is WALLET — deduct from balance.
+      // Previously, when no Wallet row existed for the user, the deduction
+      // was silently skipped — the PaymentOrder was still marked PAID and
+      // the subscription activated, but no money was actually taken. Now we
+      // throw so the transaction rolls back.
       if (order.method === "WALLET") {
         const wallet = await tx.wallet.findUnique({ where: { userId: order.userId } });
-        if (wallet) {
-          const balance = toDecimal(wallet.balance);
-          const amount = toDecimal(order.amount);
-          if (balance.lt(amount)) throw new Error("Insufficient wallet balance");
-          const newBalance = balance.minus(amount);
-          await tx.wallet.update({ where: { id: wallet.id }, data: { balance: newBalance, totalSpent: toDecimal(wallet.totalSpent).plus(amount) } });
-          await tx.walletTransaction.create({
-            data: {
-              walletId: wallet.id,
-              userId: order.userId,
-              type: "PAYMENT",
-              amount: amount.negated(),
-              balanceAfter: newBalance,
-              description: `Subscription payment — ${order.plan}`,
-              relatedOrderId: order.id,
-              status: "COMPLETED",
-            },
-          });
-        }
+        if (!wallet) throw new Error("Wallet not found — cannot pay with WALLET method");
+        const balance = toDecimal(wallet.balance);
+        const amount = toDecimal(order.amount);
+        if (balance.lt(amount)) throw new Error("Insufficient wallet balance");
+        const newBalance = balance.minus(amount);
+        await tx.wallet.update({ where: { id: wallet.id }, data: { balance: newBalance, totalSpent: toDecimal(wallet.totalSpent).plus(amount) } });
+        await tx.walletTransaction.create({
+          data: {
+            walletId: wallet.id,
+            userId: order.userId,
+            type: "PAYMENT",
+            amount: amount.negated(),
+            balanceAfter: newBalance,
+            description: `Subscription payment — ${order.plan}`,
+            relatedOrderId: order.id,
+            status: "COMPLETED",
+          },
+        });
       }
 
       await AuditService.log({ userId: verifiedBy, action: "BILLING_VERIFY", entity: "PaymentOrder", entityId: orderId, changes: { status: "PAID", transactionId } }, tx);

@@ -4,6 +4,7 @@ import { addMoney, mulMoney, subMoney, toDecimal, cmpMoney } from "@/lib/decimal
 import { InventoryService } from "./inventory";
 import { AuditService } from "./audit";
 import { getCurrentUser } from "@/lib/auth";
+import { WooCommerceService } from "./woocommerce";
 
 // Lazy-import AutomationService to avoid a circular import at module load.
 // Automation triggers are fire-and-forget and NEVER block the order transaction.
@@ -82,6 +83,17 @@ export const OrderService = {
     reserveStock?: boolean;       // if true → RESERVATION movements (not SALE); convert on DELIVERED
     conversationId?: string;      // link to omnichannel conversation
   }) {
+    // ── Idempotency: if externalId is provided and an order already exists
+    // with that externalId, return the existing order instead of creating a
+    // duplicate. This is critical for webhook redeliveries (WooCommerce can
+    // retry a webhook delivery up to 3× in 24h) and for any client retry
+    // logic. The Order.externalId column is `@unique` (sparse) so the DB
+    // also enforces this constraint at write time.
+    if (input.externalId) {
+      const existing = await db.order.findUnique({ where: { externalId: input.externalId }, include: { items: true, customer: true, channel: true } });
+      if (existing) return existing;
+    }
+
     return db.$transaction(async (tx) => {
       const user = await getCurrentUser();
       const createdBy = input.createdBy ?? user?.id;
@@ -353,6 +365,12 @@ export const OrderService = {
       const evt = eventMap[status];
       if (evt && result) {
         void fireAutomation(evt, { entityId: orderId, variables: { order_number: (result as any).orderNumber ?? orderId, business_name: "Z-CRM" } });
+      }
+      // Push the status update back to WooCommerce (fire-and-forget).
+      // Only relevant for orders that originated in Woo (have externalId).
+      // Failures are logged to SyncLog — they never break the CRM operation.
+      if (result) {
+        void WooCommerceService.pushOrderStatus(orderId, status).catch(() => {});
       }
       return result;
     });
