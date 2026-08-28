@@ -182,6 +182,10 @@ export const TelegramCommandService = {
       "/approvereturn": this.cmdApproveReturn,
       "/refund": this.cmdRefund,
       "/receivepurchase": this.cmdReceivePurchase,
+      // ── NEW Phase 6: cash register + detail views ──
+      "/register": this.cmdRegister,
+      "/purchase": this.cmdViewPurchase,
+      "/supplier": this.cmdViewSupplier,
     };
 
     // Commands that take raw "|"-separated text after the command (not the
@@ -207,6 +211,12 @@ export const TelegramCommandService = {
       "/updatesupplier": this.cmdUpdateSupplier,
       // ── NEW: purchase creation (pipe-delimited) ──
       "/createpurchase": this.cmdCreatePurchase,
+      // ── NEW Phase 6: delivery creation + update ──
+      "/delivery": this.cmdCreateDelivery,
+      "/updatedelivery": this.cmdUpdateDelivery,
+      // ── NEW Phase 6: cash register ──
+      "/openregister": this.cmdOpenRegister,
+      "/closeregister": this.cmdCloseRegister,
     };
     if (rawTextCommands[command]) {
       try {
@@ -665,6 +675,14 @@ export const TelegramCommandService = {
     if (can("returns:update")) cmds.push("/approvereturn RETURN_ID — approve pending return (applies stock + refund)");
     if (can("payments:refund")) cmds.push("/refund ORDER_ID | AMOUNT | METHOD? | REF? — record refund");
     if (can("stock_transfers:read")) cmds.push("/transfers — list stock transfers");
+    // NEW Phase 6 commands
+    if (can("deliveries:update")) cmds.push("/delivery ORDER_ID | COURIER? | TRACKING? | COST? — create delivery");
+    if (can("deliveries:update")) cmds.push("/updatedelivery DELIVERY_ID | STATUS — update delivery status");
+    if (can("cash:manage")) cmds.push("/openregister | AMOUNT — open cash register shift");
+    if (can("cash:manage")) cmds.push("/closeregister | ACTUAL_CASH — close with variance");
+    if (can("reports:read") || can("cash:manage")) cmds.push("/register — today's cash summary");
+    if (can("purchases:read")) cmds.push("/purchase PURCHASE_ID — purchase detail (items, paid, due)");
+    if (can("suppliers:read")) cmds.push("/supplier SUPPLIER_ID — supplier detail (purchases, due)");
     const text = `<b>Z-CRM Bot Commands</b>\n\nRole: <b>${ctx.roleName}</b>\nGroup: ${ctx.group.chatTitle}\n\n${cmds.map((c) => "• " + c).join("\n")}`;
     await TelegramService.sendMessage(ctx.chatId, text);
   },
@@ -2492,7 +2510,27 @@ export const TelegramCommandService = {
     if (!this.can(ctx, "deliveries:read")) return this.deny(ctx, lang);
     const d: any = await DeliveryService.get(id);
     if (!d) return TelegramService.sendMessage(ctx.chatId, "Delivery not found");
-    const text = `<b>🚚 ${d.order?.orderNumber ?? d.orderId}</b>\nStatus: <b>${d.status}</b>\nCourier: ${d.courierName ?? d.courierProvider?.name ?? "—"}\nTracking: ${d.trackingNumber ?? "—"}\nRecipient: ${d.recipientName ?? "—"} · ${d.recipientPhone ?? "—"}\nCOD: ${money(d.codAmount)}`;
+    const deliveryCharge = Number(d.deliveryCharge ?? 0);
+    const actualCost = Number(d.actualCourierCost ?? 0);
+    const returnCharge = Number(d.returnCharge ?? 0);
+    const collected = Number(d.collectedAmount ?? 0);
+    const shippingProfit = deliveryCharge - actualCost;
+    const text =
+      `<b>🚚 ${d.order?.orderNumber ?? d.orderId}</b>\n\n` +
+      `Status: <b>${d.status}</b>\n` +
+      `Courier: ${d.courierName ?? d.courierProvider?.name ?? "—"}\n` +
+      `Tracking: ${d.trackingNumber ?? "—"}\n` +
+      `Recipient: ${d.recipientName ?? "—"} · ${d.recipientPhone ?? "—"}\n` +
+      `Address: ${d.recipientAddress ?? "—"}\n\n` +
+      `<b>Financials:</b>\n` +
+      `Delivery Charge (income): ${money(deliveryCharge.toFixed(2))}\n` +
+      `Actual Courier Cost: ${money(actualCost.toFixed(2))}\n` +
+      `Shipping Profit: ${money(shippingProfit.toFixed(2))}\n` +
+      (returnCharge > 0 ? `Return Charge: ${money(returnCharge.toFixed(2))}\n` : "") +
+      `COD Amount: ${money(Number(d.codAmount ?? 0).toFixed(2))}\n` +
+      (collected > 0 ? `Collected: ${money(collected.toFixed(2))}\n` : "") +
+      (d.shippingDate ? `\nShipped: ${d.shippingDate.toISOString().slice(0, 10)}\n` : "") +
+      (d.deliveredDate ? `Delivered: ${d.deliveredDate.toISOString().slice(0, 10)}` : "");
     const rows: any[][] = [];
     if (this.can(ctx, "deliveries:update")) rows.push([{ text: "🔄 Change Status", callback_data: `delivery_status_menu:${d.id}` }]);
     rows.push([{ text: "⬅️ Back", callback_data: "deliveries_page:1" }]);
@@ -2521,6 +2559,263 @@ export const TelegramCommandService = {
     } catch (e) {
       await TelegramService.sendMessage(ctx.chatId, `❌ ${(e as Error).message}`);
     }
+  },
+
+  // ────────────────────────────────────────────────────────────────
+  // NEW Phase 6: /delivery — create a delivery for an order
+  // /delivery ORDER_ID | COURIER | TRACKING | COST
+  // ────────────────────────────────────────────────────────────────
+  async cmdCreateDelivery(ctx: CommandContext, raw: string, lang: string) {
+    if (!this.can(ctx, "deliveries:update")) return this.deny(ctx, lang);
+    const parts = raw.split("|").map((s: string) => s.trim());
+    if (parts.length < 1 || !parts[0]) {
+      return TelegramService.sendMessage(ctx.chatId,
+        "Usage: /delivery ORDER_ID | COURIER? | TRACKING? | COST?\n\n" +
+        "Creates a delivery record for the order. The delivery charge defaults to the order's shipping cost; you can override the actual courier cost.\n\n" +
+        "Example: /delivery ord_abc123 | Pathao | PA-2026-001 | 80"
+      );
+    }
+    const [orderId, courierName, trackingNumber, costStr] = parts;
+    try {
+      const delivery = await DeliveryService.create({
+        orderId,
+        courierName: courierName || undefined,
+        trackingNumber: trackingNumber || undefined,
+        actualCourierCost: costStr ? Number(costStr) : undefined,
+        createdBy: ctx.user?.id,
+      });
+      await TelegramService.sendMessage(ctx.chatId,
+        `✅ Delivery created for order.\n\n` +
+        `Delivery ID: ${(delivery as any)?.id ?? "—"}\n` +
+        `Courier: ${courierName || "—"}\n` +
+        `Tracking: ${trackingNumber || "—"}\n` +
+        `Delivery Charge: ${money(Number((delivery as any)?.deliveryCharge ?? 0).toFixed(2))}\n` +
+        `Actual Cost: ${money(Number((delivery as any)?.actualCourierCost ?? 0).toFixed(2))}\n\n` +
+        `Use /updatedelivery ${ (delivery as any)?.id ?? "" } | STATUS to update the status.`
+      );
+    } catch (e) {
+      await TelegramService.sendMessage(ctx.chatId, `❌ ${(e as Error).message}`);
+    }
+  },
+
+  // ────────────────────────────────────────────────────────────────
+  // NEW Phase 6: /updatedelivery — pipe-syntax status change shortcut
+  // /updatedelivery DELIVERY_ID | STATUS
+  // ────────────────────────────────────────────────────────────────
+  async cmdUpdateDelivery(ctx: CommandContext, raw: string, lang: string) {
+    if (!this.can(ctx, "deliveries:update")) return this.deny(ctx, lang);
+    const [deliveryId, status] = raw.split("|").map((s: string) => s.trim());
+    if (!deliveryId || !status) {
+      return TelegramService.sendMessage(ctx.chatId,
+        "Usage: /updatedelivery DELIVERY_ID | STATUS\n\n" +
+        "Statuses: PENDING, PACKED, SHIPPED, IN_TRANSIT, DELIVERED, FAILED, RETURNED"
+      );
+    }
+    try {
+      await DeliveryService.updateStatus(deliveryId, status.toUpperCase(), `Via Telegram by ${ctx.user?.firstName ?? ctx.telegramUserId}`);
+      await TelegramService.sendMessage(ctx.chatId, `✅ Delivery ${deliveryId} → <b>${status.toUpperCase()}</b>`);
+    } catch (e) {
+      await TelegramService.sendMessage(ctx.chatId, `❌ ${(e as Error).message}`);
+    }
+  },
+
+  // ────────────────────────────────────────────────────────────────
+  // NEW Phase 6: Cash Register commands
+  // /openregister | OPENING_AMOUNT — start a new cash shift
+  // /closeregister | ACTUAL_CASH — close with variance
+  // /register — show today's cash summary
+  // ────────────────────────────────────────────────────────────────
+  async cmdOpenRegister(ctx: CommandContext, raw: string, lang: string) {
+    if (!this.can(ctx, "cash:manage")) return this.deny(ctx, lang);
+    // Accept both "/openregister 5000" and "/openregister | 5000" —
+    // take the first non-empty pipe-separated part.
+    const openingStr = raw.split("|").map((s: string) => s.trim()).find((s: string) => s.length > 0);
+    if (!openingStr) {
+      return TelegramService.sendMessage(ctx.chatId, "Usage: /openregister | OPENING_AMOUNT\n\nExample: /openregister | 5000");
+    }
+    const openingAmount = Number(openingStr);
+    if (!Number.isFinite(openingAmount) || openingAmount < 0) {
+      return TelegramService.sendMessage(ctx.chatId, "❌ Invalid amount. Send a non-negative number.");
+    }
+    try {
+      // Record the opening as a cash register snapshot for today with the
+      // declared opening float. The closing balance will be computed when
+      // /closeregister is called.
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const snapshot = await db.cashRegister.upsert({
+        where: { date: today },
+        create: {
+          date: today,
+          openingBalance: openingAmount,
+          cashSales: 0,
+          customerPayments: 0,
+          refunds: 0,
+          expenses: 0,
+          closingBalance: openingAmount,
+          notes: `Register opened by ${ctx.user?.firstName ?? ctx.telegramUserId}`,
+          closedBy: ctx.user?.id,
+        },
+        update: {
+          openingBalance: openingAmount,
+          notes: `Register re-opened by ${ctx.user?.firstName ?? ctx.telegramUserId}`,
+        },
+      });
+      await AuditService.log({
+        userId: ctx.user?.id,
+        action: "CASH_REGISTER_OPEN",
+        entity: "CashRegister",
+        entityId: snapshot.id,
+        changes: { openingAmount: openingAmount.toFixed(2), date: today.toISOString() },
+        source: "TELEGRAM",
+      });
+      await TelegramService.sendMessage(ctx.chatId,
+        `✅ <b>Cash Register Opened</b>\n\n` +
+        `Opening Float: ${money(openingAmount.toFixed(2))}\n` +
+        `Date: ${today.toISOString().slice(0, 10)}\n` +
+        `Opened by: ${ctx.user?.firstName ?? ctx.telegramUserId}\n\n` +
+        `Use /register to check the current balance.\nUse /closeregister | ACTUAL_CASH to close.`
+      );
+    } catch (e) {
+      await TelegramService.sendMessage(ctx.chatId, `❌ ${(e as Error).message}`);
+    }
+  },
+
+  async cmdCloseRegister(ctx: CommandContext, raw: string, lang: string) {
+    if (!this.can(ctx, "cash:manage")) return this.deny(ctx, lang);
+    // Accept both "/closeregister 24500" and "/closeregister | 24500" —
+    // take the first non-empty pipe-separated part.
+    const actualStr = raw.split("|").map((s: string) => s.trim()).find((s: string) => s.length > 0);
+    if (!actualStr) {
+      return TelegramService.sendMessage(ctx.chatId, "Usage: /closeregister | ACTUAL_CASH\n\nExample: /closeregister | 24500\n\nThis records the physical cash count and computes the variance vs. the expected closing balance.");
+    }
+    const actualCash = Number(actualStr);
+    if (!Number.isFinite(actualCash) || actualCash < 0) {
+      return TelegramService.sendMessage(ctx.chatId, "❌ Invalid amount. Send a non-negative number.");
+    }
+    try {
+      const today = new Date();
+      const result = await CashService.closeDay(today, {
+        closedBy: ctx.user?.id,
+        actualClosingCount: actualCash,
+        notes: `Closed via Telegram by ${ctx.user?.firstName ?? ctx.telegramUserId}`,
+      });
+      const variance = result.variance ? Number(result.variance) : 0;
+      const varianceSign = variance > 0 ? "📈 Surplus" : variance < 0 ? "📉 Shortage" : "✅ Balanced";
+      await TelegramService.sendMessage(ctx.chatId,
+        `✅ <b>Cash Register Closed</b>\n\n` +
+        `Opening: ${result.openingBalance ? Number(result.openingBalance).toFixed(2) : "—"}\n` +
+        `+ Cash Sales: ${result.cashSales ? Number(result.cashSales).toFixed(2) : "—"}\n` +
+        `+ Customer Payments: ${result.customerPayments ? Number(result.customerPayments).toFixed(2) : "—"}\n` +
+        `− Refunds: ${result.refunds ? Number(result.refunds).toFixed(2) : "—"}\n` +
+        `− Expenses: ${result.expenses ? Number(result.expenses).toFixed(2) : "—"}\n` +
+        `─────────────\n` +
+        `Expected Closing: ${result.expectedClosing ?? "—"}\n` +
+        `Actual Counted: ${result.actualClosingCount ?? "—"}\n` +
+        `<b>Variance: ${result.variance ?? "—"}</b> (${varianceSign})`
+      );
+    } catch (e) {
+      await TelegramService.sendMessage(ctx.chatId, `❌ ${(e as Error).message}`);
+    }
+  },
+
+  async cmdRegister(ctx: CommandContext, _args: string[], lang: string) {
+    if (!this.can(ctx, "reports:read") && !this.can(ctx, "cash:manage")) return this.deny(ctx, lang);
+    try {
+      const summary = await CashService.summary();
+      await TelegramService.sendMessage(ctx.chatId,
+        `💵 <b>Cash Register — Today</b>\n\n` +
+        `Opening: ${summary.openingBalance}\n` +
+        `+ Cash Sales: ${summary.cashSales}\n` +
+        `+ Customer Payments: ${summary.customerPayments}\n` +
+        `− Refunds: ${summary.refunds}\n` +
+        `− Expenses: ${summary.expenses}\n` +
+        `─────────────\n` +
+        `<b>Expected Closing: ${summary.closingBalance}</b>\n\n` +
+        `Payments: ${summary.paymentCount} | Expenses: ${summary.expenseCount} | Refunds: ${summary.refundCount}\n\n` +
+        `Use /closeregister | ACTUAL_CASH to close with a physical count.`
+      );
+    } catch (e) {
+      await TelegramService.sendMessage(ctx.chatId, `❌ ${(e as Error).message}`);
+    }
+  },
+
+  // ────────────────────────────────────────────────────────────────
+  // NEW Phase 6: /purchase PURCHASE_ID — detail view
+  // /supplier SUPPLIER_ID — detail view
+  // ────────────────────────────────────────────────────────────────
+  async cmdViewPurchase(ctx: CommandContext, args: string[], lang: string) {
+    if (!this.can(ctx, "purchases:read")) return this.deny(ctx, lang);
+    const purchaseId = args[0]?.trim();
+    if (!purchaseId) return TelegramService.sendMessage(ctx.chatId, "Usage: /purchase PURCHASE_ID");
+    const p = await db.purchase.findUnique({
+      where: { id: purchaseId },
+      include: {
+        supplier: { select: { id: true, name: true, phone: true } },
+        items: { include: { product: { select: { name: true, sku: true } } } },
+      },
+    });
+    if (!p) return TelegramService.sendMessage(ctx.chatId, "❌ Purchase not found.");
+    const itemsText = p.items.map((it: any, i: number) => `${i + 1}. ${it.product?.name ?? "—"} (${it.product?.sku ?? "—"}) × ${it.quantity} @ ${money(Number(it.unitCost).toFixed(2))} = ${money(Number(it.total).toFixed(2))}`).join("\n");
+    const text =
+      `<b>🛒 ${p.purchaseNumber}</b>\n\n` +
+      `Supplier: ${p.supplier?.name ?? "—"} (${p.supplier?.phone ?? "—"})\n` +
+      `Status: <b>${p.status}</b> | Payment: ${p.paymentStatus}\n` +
+      `Date: ${p.createdAt.toISOString().slice(0, 10)}\n\n` +
+      `<b>Items:</b>\n${itemsText}\n\n` +
+      `Subtotal: ${money(Number(p.subtotal).toFixed(2))}\n` +
+      (Number(p.discount) > 0 ? `Discount: -${money(Number(p.discount).toFixed(2))}\n` : "") +
+      (Number(p.shippingCost) > 0 ? `Shipping: ${money(Number(p.shippingCost).toFixed(2))}\n` : "") +
+      `─────────────\n` +
+      `<b>Total: ${money(Number(p.total).toFixed(2))}</b>\n` +
+      `Paid: ${money(Number(p.paidAmount).toFixed(2))}\n` +
+      `<b>Due: ${money(Number(p.dueAmount).toFixed(2))}</b>`;
+    const rows: any[][] = [];
+    if (this.can(ctx, "purchases:update") && p.status === "PENDING") {
+      rows.push([{ text: "📥 Receive Purchase", callback_data: `purchase_receive:${p.id}` }]);
+    }
+    rows.push([{ text: "⬅️ Back", callback_data: "purchases_page:1" }]);
+    await TelegramService.sendMessage(ctx.chatId, text, { inline_keyboard: rows });
+  },
+
+  async cmdViewSupplier(ctx: CommandContext, args: string[], lang: string) {
+    if (!this.can(ctx, "suppliers:read")) return this.deny(ctx, lang);
+    const supplierId = args[0]?.trim();
+    if (!supplierId) return TelegramService.sendMessage(ctx.chatId, "Usage: /supplier SUPPLIER_ID");
+    const s = await db.supplier.findUnique({
+      where: { id: supplierId },
+      include: {
+        _count: { select: { purchases: true } },
+        purchases: { orderBy: { createdAt: "desc" }, take: 5, select: { id: true, purchaseNumber: true, total: true, paidAmount: true, status: true, createdAt: true } },
+      },
+    });
+    if (!s) return TelegramService.sendMessage(ctx.chatId, "❌ Supplier not found.");
+    const purchaseAgg = await db.purchase.aggregate({
+      where: { supplierId: s.id },
+      _sum: { total: true, paidAmount: true, dueAmount: true },
+    });
+    const totalPurchases = Number(purchaseAgg._sum.total ?? 0);
+    const totalPaid = Number(purchaseAgg._sum.paidAmount ?? 0);
+    const totalDue = Number(purchaseAgg._sum.dueAmount ?? 0);
+    const recentPurchases = s.purchases.map((p: any) => `• ${p.purchaseNumber} — ${money(Number(p.total).toFixed(2))} (${p.status})`).join("\n");
+    const text =
+      `<b>🏭 ${s.name}</b>\n\n` +
+      `📞 ${s.phone ?? "—"}\n` +
+      `📧 ${s.email ?? "—"}\n` +
+      `🏢 ${s.company ?? "—"}\n` +
+      `📍 ${s.address ?? "—"}\n\n` +
+      `<b>Financials:</b>\n` +
+      `Total Purchases: ${money(totalPurchases.toFixed(2))}\n` +
+      `Total Paid: ${money(totalPaid.toFixed(2))}\n` +
+      `<b>Outstanding Due: ${money(totalDue.toFixed(2))}</b>\n` +
+      `Purchase Count: ${s._count.purchases}\n\n` +
+      `<b>Recent Purchases:</b>\n${recentPurchases || "—"}`;
+    const rows: any[][] = [];
+    if (this.can(ctx, "purchases:create")) {
+      rows.push([{ text: "🛒 Create Purchase", callback_data: "menu" }]);
+    }
+    rows.push([{ text: "⬅️ Back", callback_data: "suppliers_page:1" }]);
+    await TelegramService.sendMessage(ctx.chatId, text, { inline_keyboard: rows });
   },
 
   // --- Returns: list, view ---
