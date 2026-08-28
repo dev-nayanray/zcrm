@@ -282,6 +282,11 @@ model OrderItem {
   unitCost   Float  // snapshot purchase cost (COGS)
   discount    Float  @default(0)
   total       Float  @default(0)
+  // Phase 8: integer minor-unit mirrors
+  unitPriceMinor Int?
+  unitCostMinor   Int?
+  discountMinor   Int?
+  totalMinor      Int?
   createdAt   DateTime @default(now())
 
   @@index([orderId])
@@ -310,7 +315,8 @@ model Payment {
   order              Order    @relation(fields: [orderId], references: [id], onDelete: Restrict, onUpdate: NoAction)
   customerId        String
   customer           Customer @relation(fields: [customerId], references: [id], onDelete: Restrict, onUpdate: NoAction)
-  amount             Float 
+  amount             Float
+  amountMinor        Int?  // Phase 8: integer minor-unit (poisha) mirror
   method             String   // CASH|BKASH|NAGAD|BANK|CARD|OTHER
   transactionReference String?
   notes              String?
@@ -469,6 +475,10 @@ model Purchase {
   total         Float  @default(0)
   paidAmount    Float  @default(0)
   dueAmount     Float  @default(0)
+  // Phase 8: integer minor-unit mirrors
+  totalMinor      Int?
+  paidAmountMinor Int?
+  dueAmountMinor  Int?
   paymentStatus String   @default("UNPAID") // UNPAID|PARTIAL|PAID
   notes         String?
   createdBy     String?
@@ -491,8 +501,11 @@ model PurchaseItem {
   productId   String
   product     Product  @relation(fields: [productId], references: [id], onDelete: Restrict, onUpdate: NoAction)
   quantity    Float 
-  unitCost    Float 
-  total       Float 
+  unitCost    Float
+  total       Float
+  // Phase 8: integer minor-unit mirrors
+  unitCostMinor Int?
+  totalMinor    Int?
   createdAt   DateTime @default(now())
 
   @@index([purchaseId])
@@ -517,6 +530,7 @@ model Expense {
   categoryId    String
   category      ExpenseCategory @relation(fields: [categoryId], references: [id], onDelete: Restrict, onUpdate: NoAction)
   amount        Float
+  amountMinor   Int?  // Phase 8: integer minor-unit mirror
   paymentMethod String   // CASH|BKASH|NAGAD|BANK|CARD|OTHER
   description   String?
   reference     String?
@@ -593,6 +607,7 @@ model Refund {
   returnId           String?
   return             Return?  @relation(fields: [returnId], references: [id], onDelete: SetNull, onUpdate: NoAction)
   amount             Float
+  amountMinor        Int?  // Phase 8: integer minor-unit mirror
   method             String   // CASH|BKASH|NAGAD|BANK|CARD|OTHER
   transactionReference String?
   notes              String?
@@ -907,6 +922,12 @@ model Delivery {
   // Collected amount — what the courier actually collected from the customer
   // (may differ from codAmount if partial collection, discount, or short-payment).
   collectedAmount Float  @default(0)
+  // Phase 8: integer minor-unit mirrors
+  deliveryChargeMinor     Int?
+  actualCourierCostMinor  Int?
+  returnChargeMinor       Int?
+  codAmountMinor          Int?
+  collectedAmountMinor    Int?
   status          String   @default("PENDING") // PENDING|PACKED|SHIPPED|IN_TRANSIT|DELIVERED|FAILED|RETURNED
   courierConsignmentId String? // provider's consignment/waybill id
   recipientName   String?

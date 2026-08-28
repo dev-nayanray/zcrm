@@ -95,6 +95,8 @@ export const PaymentService = {
           customerId: order.customerId,
           // Schema stores Float — convert Decimal via toNumber().
           amount: amount.toNumber(),
+          // Phase 8: dual-write integer minor-unit
+          amountMinor: Number((amount.times(100).round()).toString()),
           method: input.method,
           transactionReference: input.transactionReference,
           notes: input.notes,
