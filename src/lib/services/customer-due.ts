@@ -9,11 +9,139 @@ import { getCurrentUser } from "@/lib/auth";
 // tables (no duplicate accounting). Supports advance payments (credit) stored
 // in CustomerCredit.advanceAmount.
 //
+// ─────────────────────────────────────────────────────────────────────────────
+// DUE FORMULA (the single source of truth)
+// ─────────────────────────────────────────────────────────────────────────────
+//   totalDue = Σ(order.total where status != CANCELLED)
+//              − Σ(payment.amount)
+//              + Σ(refund.amount)        // refunds increase due (we owe the customer)
+//              − Σ(customerCredit.advanceAmount)  // customer pre-payments reduce due
+//
+// The `due` is DERIVED — never stored as a balance. The CustomerCredit row
+// only holds `advanceAmount` (customer pre-payment) and `creditLimit`.
+//
+// AGING BUCKETS (computed per-order based on each order's `createdAt`):
+//   0–7 days | 8–30 days | 31–60 days | 61–90 days | 90+ days
+//
 // FIX: recordAdvance and setCreditLimit now validate amount positivity and
 // write audit logs (previously unaudited — a serious gap for a finance
 // operation). The list endpoint now returns the FILTERED total (was: the
 // unfiltered count, so pagination was broken when filtering by status).
 export const CustomerDueService = {
+  /**
+   * Compute a single customer's due, derived live from orders + payments +
+   * refunds + advance. This is the canonical due figure — every other
+   * method on this service ultimately calls this.
+   *
+   * Returns:
+   *   totalSales, totalPaid, totalRefund, advance, totalDue,
+   *   outstandingOrders[] (per-order due breakdown with aging bucket),
+   *   aging: { "0-7": n, "8-30": n, "31-60": n, "61-90": n, "90+": n }
+   *   lastPayment: { amount, method, date } | null
+   */
+  async computeDue(customerId: string) {
+    const customer = await db.customer.findUnique({ where: { id: customerId }, include: { customerCredit: true } });
+    if (!customer) throw new Error("Customer not found");
+
+    // Aggregate orders (exclude CANCELLED — they're not sales)
+    const orderAgg = await db.order.aggregate({
+      where: { customerId, status: { not: "CANCELLED" } },
+      _sum: { total: true, paidAmount: true },
+      _count: true,
+    });
+    const totalSales = toDecimal(orderAgg._sum.total ?? 0);
+
+    // Aggregate payments
+    const payAgg = await db.payment.aggregate({ where: { customerId }, _sum: { amount: true } });
+    const totalPaid = toDecimal(payAgg._sum.amount ?? 0);
+
+    // Aggregate refunds (refunds increase due — we owe the customer)
+    const refundAgg = await db.refund.aggregate({
+      where: { order: { customerId } },
+      _sum: { amount: true },
+    });
+    const totalRefund = toDecimal(refundAgg._sum.amount ?? 0);
+
+    // Advance payment (customer pre-payment) reduces due
+    const advance = toDecimal(customer.customerCredit?.advanceAmount ?? 0);
+
+    // Total due — never let it go negative (negative means we owe the
+    // customer, which is captured by the `advance` field separately).
+    const rawDue = totalSales.minus(totalPaid).plus(totalRefund).minus(advance);
+    const totalDue = rawDue.lt(0) ? new Prisma.Decimal(0) : rawDue;
+
+    // Per-order due breakdown for aging
+    const orders = await db.order.findMany({
+      where: { customerId, status: { not: "CANCELLED" } },
+      orderBy: { createdAt: "desc" },
+      select: {
+        id: true,
+        orderNumber: true,
+        total: true,
+        paidAmount: true,
+        createdAt: true,
+        status: true,
+      },
+    });
+    const outstandingOrders = orders
+      .map((o) => {
+        const due = toDecimal(o.total).minus(toDecimal(o.paidAmount));
+        const duePositive = due.lt(0) ? new Prisma.Decimal(0) : due;
+        return {
+          id: o.id,
+          orderNumber: o.orderNumber,
+          total: toDecimal(o.total).toFixed(2),
+          paid: toDecimal(o.paidAmount).toFixed(2),
+          due: duePositive.toFixed(2),
+          createdAt: o.createdAt,
+          status: o.status,
+          ageDays: Math.floor((Date.now() - o.createdAt.getTime()) / (1000 * 60 * 60 * 24)),
+        };
+      })
+      .filter((o) => Number(o.due) > 0);
+
+    // Aging buckets
+    const aging = { "0-7": new Prisma.Decimal(0), "8-30": new Prisma.Decimal(0), "31-60": new Prisma.Decimal(0), "61-90": new Prisma.Decimal(0), "90+": new Prisma.Decimal(0) };
+    for (const o of outstandingOrders) {
+      const due = toDecimal(o.due);
+      if (o.ageDays <= 7) aging["0-7"] = aging["0-7"].plus(due);
+      else if (o.ageDays <= 30) aging["8-30"] = aging["8-30"].plus(due);
+      else if (o.ageDays <= 60) aging["31-60"] = aging["31-60"].plus(due);
+      else if (o.ageDays <= 90) aging["61-90"] = aging["61-90"].plus(due);
+      else aging["90+"] = aging["90+"].plus(due);
+    }
+
+    // Last payment
+    const lastPayment = await db.payment.findFirst({
+      where: { customerId },
+      orderBy: { createdAt: "desc" },
+      select: { amount: true, method: true, createdAt: true, transactionReference: true },
+    });
+
+    return {
+      customerId: customer.id,
+      customerName: customer.name,
+      customerPhone: customer.phone,
+      totalSales: totalSales.toFixed(2),
+      totalPaid: totalPaid.toFixed(2),
+      totalRefund: totalRefund.toFixed(2),
+      advance: advance.toFixed(2),
+      totalDue: totalDue.toFixed(2),
+      orderCount: orderAgg._count,
+      outstandingOrders,
+      aging: {
+        "0-7": aging["0-7"].toFixed(2),
+        "8-30": aging["8-30"].toFixed(2),
+        "31-60": aging["31-60"].toFixed(2),
+        "61-90": aging["61-90"].toFixed(2),
+        "90+": aging["90+"].toFixed(2),
+      },
+      lastPayment: lastPayment
+        ? { amount: toDecimal(lastPayment.amount).toFixed(2), method: lastPayment.method, date: lastPayment.createdAt, reference: lastPayment.transactionReference }
+        : null,
+    };
+  },
+
   async list(opts: { page: number; limit: number; search?: string; minDue?: number; status?: string; from?: Date; to?: Date }) {
     const where: Prisma.CustomerWhereInput = {};
     if (opts.search) where.OR = [{ name: { contains: opts.search } }, { phone: { contains: opts.search } }, { email: { contains: opts.search } }, { city: { contains: opts.search } }];
@@ -88,7 +216,7 @@ export const CustomerDueService = {
     const credit = await this.getCredit(customerId);
     const updated = await db.customerCredit.update({
       where: { customerId },
-      data: { advanceAmount: toDecimal(credit.advanceAmount).plus(amt) },
+      data: { advanceAmount: toDecimal(credit.advanceAmount).plus(amt).toNumber() },
     });
     await AuditService.log({
       userId: user?.id,
@@ -110,7 +238,7 @@ export const CustomerDueService = {
     const credit = await this.getCredit(customerId);
     const updated = await db.customerCredit.update({
       where: { customerId },
-      data: { creditLimit: amt },
+      data: { creditLimit: amt.toNumber() },
     });
     await AuditService.log({
       userId: user?.id,

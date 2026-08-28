@@ -148,6 +148,12 @@ model Product {
   purchasePrice    Float  @default(0)
   sellingPrice     Float  @default(0)
   wholesalePrice   Float  @default(0)
+  // Weighted Average Cost — recomputed on every purchase receipt:
+  //   WAC = (currentStock * currentWAC + newQty * newUnitCost) / (currentStock + newQty)
+  // Used as the COGS source for OrderItem.unitCost snapshots so that
+  // historical profit reflects the blended cost of inventory at sale time,
+  // not just the most recent purchase price. See CostingService.
+  weightedAverageCost Float @default(0)
   minimumStockLevel Float @default(0)
   imageUrl         String?
   status           String   @default("ACTIVE") // ACTIVE | INACTIVE
@@ -180,6 +186,7 @@ model Supplier {
   notes     String?
   purchases Purchase[]
   supplierPayments SupplierPayment[]
+  expenses   Expense[]  // supplier-linked expenses (e.g. supplier payments recorded as expenses)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -207,14 +214,24 @@ model Order {
   customer      Customer @relation(fields: [customerId], references: [id], onDelete: Restrict, onUpdate: NoAction)
   channelId     String
   channel       Channel @relation(fields: [channelId], references: [id], onDelete: Restrict, onUpdate: NoAction)
-  status        String   @default("PENDING") // PENDING|CONFIRMED|PROCESSING|SHIPPED|DELIVERED|CANCELLED|RETURNED|REFUNDED
+  status        String   @default("PENDING") // PENDING|CONFIRMED|PROCESSING|READY_TO_SHIP|SHIPPED|DELIVERED|COMPLETED|CANCELLED|RETURN_REQUESTED|RETURNED|REFUNDED
   paymentStatus String   @default("UNPAID") // UNPAID|PARTIAL|PAID|REFUNDED
-  subtotal      Float  @default(0)
-  discount      Float  @default(0)
-  shippingCost  Float  @default(0)
-  otherCost     Float  @default(0)
-  total         Float  @default(0)
+  // ── Financial snapshot (server-computed on create/update; never trusted from client) ──
+  subtotal      Float  @default(0)  // Σ line totals (qty × unitPrice − lineDiscount)
+  discount      Float  @default(0)  // order-level discount (separate from per-line discount)
+  tax           Float  @default(0)  // sales tax / VAT charged to customer
+  shippingCost  Float  @default(0)  // shipping income — what customer paid for delivery
+  otherIncome   Float  @default(0)  // miscellaneous income on this order (gift wrap, etc.)
+  otherCost     Float  @default(0)  // legacy: order-level cost bucket (kept for back-compat)
+  packagingCost Float  @default(0)  // packaging materials cost (fulfilment)
+  paymentFee    Float  @default(0)  // payment-gateway fee (bKash/Nagad/Card charge)
+  platformFee   Float  @default(0)  // marketplace commission (Woo/Facebook cut)
+  total         Float  @default(0)  // NET SALES = subtotal − discount + tax + shippingCost + otherIncome + otherCost
   paidAmount    Float  @default(0)
+  // Computed profitability snapshot (re-derived whenever the order changes)
+  cogsTotal     Float  @default(0)  // Σ OrderItem.unitCost × quantity  (historical snapshot)
+  grossProfit   Float  @default(0)  // (total − tax) − cogsTotal  [revenue minus direct cost]
+  netProfit     Float  @default(0)  // grossProfit − (shippingCost + otherCost + packagingCost + paymentFee + platformFee) − orderExpenses
   externalId    String?  @unique // WooCommerce order id (sparse unique — duplicate-prevention across webhooks, manual entry, and Telegram)
   syncStatus    String   @default("LOCAL") // LOCAL|SYNCED|FAILED
   sourceChannel String?  // legacy label
@@ -229,6 +246,7 @@ model Order {
   returns       Return[]
   refunds       Refund[]
   delivery      Delivery?
+  expenses      Expense[] @relation("OrderExpenses")  // order-specific expenses (courier/packaging/fees)
   conversation Conversation? @relation("ConversationOrders", fields: [conversationId], references: [id], onDelete: SetNull, onUpdate: NoAction)
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
@@ -361,6 +379,7 @@ model Warehouse {
   transfersFrom  StockTransfer[] @relation("TransferFrom")
   transfersTo    StockTransfer[] @relation("TransferTo")
   stockCounts    StockCount[]
+  expenses       Expense[]  // warehouse-specific expenses
 }
 
 model WarehouseStock {
@@ -474,11 +493,21 @@ model Expense {
   id            String   @id @default(cuid()) @map("_id")
   categoryId    String
   category      ExpenseCategory @relation(fields: [categoryId], references: [id], onDelete: Restrict, onUpdate: NoAction)
-  amount        Float 
+  amount        Float
   paymentMethod String   // CASH|BKASH|NAGAD|BANK|CARD|OTHER
   description   String?
   reference     String?
   expenseDate   DateTime @default(now())
+  // Optional links — an expense can be tied to an order (order-specific
+  // cost: courier, packaging, gateway fee), a supplier (supplier payment
+  // recorded as an expense), or a warehouse (warehouse-specific cost).
+  // General business expenses (Facebook ads, rent, salary) leave all three null.
+  orderId       String?
+  order         Order?   @relation("OrderExpenses", fields: [orderId], references: [id], onDelete: SetNull, onUpdate: NoAction)
+  supplierId    String?
+  supplier      Supplier? @relation(fields: [supplierId], references: [id], onDelete: SetNull, onUpdate: NoAction)
+  warehouseId   String?
+  warehouse     Warehouse? @relation(fields: [warehouseId], references: [id], onDelete: SetNull, onUpdate: NoAction)
   createdBy     String?
   creator       User?    @relation(fields: [createdBy], references: [id], onDelete: SetNull, onUpdate: NoAction)
   createdAt     DateTime @default(now())
@@ -487,6 +516,9 @@ model Expense {
   @@index([categoryId])
   @@index([expenseDate])
   @@index([paymentMethod])
+  @@index([orderId])
+  @@index([supplierId])
+  @@index([warehouseId])
 }
 
 // ---------------------------------------------------------------------------
@@ -836,8 +868,17 @@ model Delivery {
   courierProvider CourierProvider? @relation(fields: [courierProviderId], references: [id], onDelete: SetNull, onUpdate: NoAction)
   courierName     String?
   trackingNumber  String?
+  // Shipping INCOME — what the customer paid for delivery (mirrors Order.shippingCost).
   deliveryCharge  Float  @default(0)
+  // Actual courier COST — what the courier charged us (may differ from charge).
+  // Shipping Profit = deliveryCharge − actualCourierCost.
+  actualCourierCost Float @default(0)
+  // Return charge — extra cost if the parcel was returned to sender.
+  returnCharge    Float  @default(0)
   codAmount       Float  @default(0)
+  // Collected amount — what the courier actually collected from the customer
+  // (may differ from codAmount if partial collection, discount, or short-payment).
+  collectedAmount Float  @default(0)
   status          String   @default("PENDING") // PENDING|PACKED|SHIPPED|IN_TRANSIT|DELIVERED|FAILED|RETURNED
   courierConsignmentId String? // provider's consignment/waybill id
   recipientName   String?

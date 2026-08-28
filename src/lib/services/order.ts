@@ -5,6 +5,8 @@ import { InventoryService } from "./inventory";
 import { AuditService } from "./audit";
 import { getCurrentUser } from "@/lib/auth";
 import { WooCommerceService } from "./woocommerce";
+import { CostingService } from "./costing";
+import { ProfitabilityService } from "./profitability";
 
 // Lazy-import AutomationService to avoid a circular import at module load.
 // Automation triggers are fire-and-forget and NEVER block the order transaction.
@@ -39,11 +41,14 @@ async function fireAutomation(event: string, ctx: { entityId?: string; variables
 //
 // Same-status is always allowed (no-op).
 const ORDER_FORWARD: Record<string, string[]> = {
-  PENDING: ["CONFIRMED", "PROCESSING", "SHIPPED", "DELIVERED", "CANCELLED"],
-  CONFIRMED: ["PROCESSING", "SHIPPED", "DELIVERED", "CANCELLED"],
-  PROCESSING: ["SHIPPED", "DELIVERED", "CANCELLED"],
-  SHIPPED: ["DELIVERED", "RETURNED", "CANCELLED"],
-  DELIVERED: ["RETURNED", "REFUNDED"],
+  PENDING: ["CONFIRMED", "PROCESSING", "READY_TO_SHIP", "SHIPPED", "DELIVERED", "COMPLETED", "CANCELLED"],
+  CONFIRMED: ["PROCESSING", "READY_TO_SHIP", "SHIPPED", "DELIVERED", "COMPLETED", "CANCELLED"],
+  PROCESSING: ["READY_TO_SHIP", "SHIPPED", "DELIVERED", "COMPLETED", "CANCELLED"],
+  READY_TO_SHIP: ["SHIPPED", "DELIVERED", "COMPLETED", "CANCELLED"],
+  SHIPPED: ["DELIVERED", "COMPLETED", "RETURN_REQUESTED", "CANCELLED"],
+  DELIVERED: ["COMPLETED", "RETURN_REQUESTED", "RETURNED", "REFUNDED"],
+  COMPLETED: ["RETURN_REQUESTED", "RETURNED", "REFUNDED"],
+  RETURN_REQUESTED: ["RETURNED", "CANCELLED"],
   RETURNED: ["REFUNDED"],
   CANCELLED: [],
   REFUNDED: [],
@@ -71,8 +76,13 @@ export const OrderService = {
     channelId?: string;
     status?: string;
     discount?: Prisma.Decimal | number | string;
-    shippingCost?: Prisma.Decimal | number | string;
+    tax?: Prisma.Decimal | number | string;            // sales tax / VAT
+    shippingCost?: Prisma.Decimal | number | string;   // shipping income (customer charge)
+    otherIncome?: Prisma.Decimal | number | string;   // gift wrap, surcharges
     otherCost?: Prisma.Decimal | number | string;
+    packagingCost?: Prisma.Decimal | number | string;  // packaging materials
+    paymentFee?: Prisma.Decimal | number | string;    // gateway fee
+    platformFee?: Prisma.Decimal | number | string;   // marketplace commission
     notes?: string;
     sourceChannel?: string;
     externalId?: string;
@@ -136,7 +146,9 @@ export const OrderService = {
         if (qty.lte(0)) throw new Error(`Quantity must be positive for ${product.sku}`);
 
         const unitPrice = toDecimal(product.sellingPrice);
-        const unitCost = toDecimal(product.purchasePrice);
+        // COGS basis: prefer Weighted Average Cost (WAC); fall back to
+        // purchasePrice for products seeded before WAC was implemented.
+        const unitCost = await CostingService.getCostBasisInTx(tx, item.productId);
         const lineDiscount = toDecimal(item.discount ?? 0);
         const lineTotal = qty.times(unitPrice).minus(lineDiscount);
         if (lineTotal.lt(0)) throw new Error(`Line total negative for ${product.sku}`);
@@ -156,9 +168,15 @@ export const OrderService = {
       }
 
       const discount = toDecimal(input.discount ?? 0);
+      const tax = toDecimal(input.tax ?? 0);
       const shippingCost = toDecimal(input.shippingCost ?? 0);
+      const otherIncome = toDecimal(input.otherIncome ?? 0);
       const otherCost = toDecimal(input.otherCost ?? 0);
-      const total = subtotal.minus(discount).plus(shippingCost).plus(otherCost);
+      const packagingCost = toDecimal(input.packagingCost ?? 0);
+      const paymentFee = toDecimal(input.paymentFee ?? 0);
+      const platformFee = toDecimal(input.platformFee ?? 0);
+      // NET SALES = subtotal − discount + tax + shippingCost + otherIncome + otherCost
+      const total = subtotal.minus(discount).plus(tax).plus(shippingCost).plus(otherIncome).plus(otherCost);
       if (total.lt(0)) throw new Error("Order total cannot be negative");
 
       // Generate order number
@@ -176,12 +194,19 @@ export const OrderService = {
           channelId: channelId!,
           status,
           paymentStatus: "UNPAID",
-          subtotal,
-          discount,
-          shippingCost,
-          otherCost,
-          total,
-          paidAmount: new Prisma.Decimal(0),
+          // Schema stores Float — convert Decimals via toNumber() for write.
+          // The arithmetic above preserved precision; storage rounds to float64.
+          subtotal: subtotal.toNumber(),
+          discount: discount.toNumber(),
+          tax: tax.toNumber(),
+          shippingCost: shippingCost.toNumber(),
+          otherIncome: otherIncome.toNumber(),
+          otherCost: otherCost.toNumber(),
+          packagingCost: packagingCost.toNumber(),
+          paymentFee: paymentFee.toNumber(),
+          platformFee: platformFee.toNumber(),
+          total: total.toNumber(),
+          paidAmount: 0,
           externalId: input.externalId,
           syncStatus: input.syncStatus ?? "LOCAL",
           sourceChannel: input.sourceChannel,
@@ -189,13 +214,29 @@ export const OrderService = {
           conversationId: input.conversationId ?? null,
           notes: input.notes,
           createdBy,
-          items: { create: lineItems },
+          items: { create: lineItems.map((li) => ({
+            productId: li.productId,
+            productName: li.productName,
+            sku: li.sku,
+            quantity: li.quantity.toNumber(),
+            unitPrice: li.unitPrice.toNumber(),
+            unitCost: li.unitCost.toNumber(),
+            discount: li.discount.toNumber(),
+            total: li.total.toNumber(),
+          })) },
           statusHistory: {
             create: { status, note: reserveStock ? "Order created (stock reserved)" : "Order created", createdBy },
           },
         },
         include: { items: true },
       });
+
+      // ── Compute & persist the profitability snapshot ──
+      // This must run AFTER the order + items + any linked expenses exist
+      // in the tx so that ProfitabilityService.computeOrderSnapshot can
+      // read them. The snapshot (cogsTotal, grossProfit, netProfit) is then
+      // persisted on the order row for fast dashboard/report queries.
+      await ProfitabilityService.persistSnapshot(order.id, tx);
 
       // Stock movement: RESERVATION (if reserveStock) or SALE (default) per line.
       for (const li of lineItems) {
@@ -230,7 +271,8 @@ export const OrderService = {
           data: {
             orderId: order.id,
             customerId: customer.id,
-            amount: pmtAmt,
+            // Schema stores Float — convert Decimal via toNumber().
+            amount: pmtAmt.toNumber(),
             method: input.payment.method,
             transactionReference: input.payment.transactionReference,
             notes: input.payment.notes,
@@ -242,7 +284,7 @@ export const OrderService = {
         else paymentStatus = "PARTIAL";
         await tx.order.update({
           where: { id: order.id },
-          data: { paidAmount, paymentStatus },
+          data: { paidAmount: paidAmount.toNumber(), paymentStatus },
         });
       }
 
@@ -392,7 +434,7 @@ export const OrderService = {
       else if (paid.gt(0)) status = "PARTIAL";
       await tx.order.update({
         where: { id: orderId },
-        data: { paidAmount: paid, paymentStatus: status },
+        data: { paidAmount: paid.toNumber(), paymentStatus: status },
       });
     });
   },

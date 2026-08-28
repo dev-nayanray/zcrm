@@ -1,10 +1,13 @@
 import { db } from "@/lib/db";
+import { Prisma } from "@prisma/client";
 import { TelegramService } from "./telegram";
 import { OrderService } from "./order";
 import { PaymentService } from "./payment";
 import { InventoryService } from "./inventory";
 import { StockReconciliationService } from "./stock-reconciliation";
 import { AccountingService } from "./accounting";
+import { ProfitabilityService } from "./profitability";
+import { CustomerDueService } from "./customer-due";
 import { CashService } from "./cash";
 import { LeadService } from "./lead";
 import { NotificationService } from "./notification";
@@ -155,6 +158,11 @@ export const TelegramCommandService = {
       "/stockadjust": this.cmdStockAdjustShortcut,
       // ── NEW: today / summary / dashboard ──
       "/today": this.cmdToday, "/summary": this.cmdSummary, "/dashboard": this.cmdDashboard,
+      // ── NEW: /profit with date-range support ──
+      "/profit": this.cmdProfit,
+      "/cogs": this.cmdCogs,
+      "/sales": this.cmdSales,
+      "/duereport": this.cmdDueReport,
     };
 
     // Commands that take raw "|"-separated text after the command (not the
@@ -596,6 +604,11 @@ export const TelegramCommandService = {
     if (can("inventory:adjust")) cmds.push("/stockadjust PRODUCT_ID | NEW_QTY | REASON? — set stock");
     if (can("refunds:read")) cmds.push("/refunds — recent refunds");
     if (can("reports:read")) cmds.push("/salesreport /profitreport /expensereport /inventoryreport /paymentreport /orderreport /purchasereport — quick reports");
+    // NEW Phase 2 accounting commands
+    if (can("reports:read") || can("dashboard:read")) cmds.push("/profit today|week|month|YYYY-MM-DD YYYY-MM-DD — P&L with date filter");
+    if (can("reports:read") || can("dashboard:read")) cmds.push("/sales — sales report (default: this month)");
+    if (can("reports:read") || can("dashboard:read")) cmds.push("/cogs — COGS + gross margin (default: this month)");
+    if (can("reports:read") || can("customers:read")) cmds.push("/duereport — customer due aging buckets");
     const text = `<b>Z-CRM Bot Commands</b>\n\nRole: <b>${ctx.roleName}</b>\nGroup: ${ctx.group.chatTitle}\n\n${cmds.map((c) => "• " + c).join("\n")}`;
     await TelegramService.sendMessage(ctx.chatId, text);
   },
@@ -1273,19 +1286,22 @@ export const TelegramCommandService = {
     start.setHours(0, 0, 0, 0);
     const end = new Date();
     end.setHours(23, 59, 59, 999);
-    const [orders, payments, expenses, refunds] = await Promise.all([
-      db.order.findMany({ where: { createdAt: { gte: start, lte: end }, status: { not: "CANCELLED" } } }),
-      db.payment.findMany({ where: { createdAt: { gte: start, lte: end } } }),
-      db.expense.findMany({ where: { expenseDate: { gte: start, lte: end } } }),
-      db.refund.findMany({ where: { createdAt: { gte: start, lte: end } } }),
-    ]);
-    const revenue = orders.reduce((s: number, o: any) => s + (o.total ?? 0), 0);
-    const cogs = await db.orderItem.aggregate({ where: { order: { createdAt: { gte: start, lte: end }, status: { not: "CANCELLED" } } }, _sum: { unitCost: true } });
-    const paidToday = payments.reduce((s: number, p: any) => s + (p.amount ?? 0), 0);
-    const expToday = expenses.reduce((s: number, e: any) => s + (e.amount ?? 0), 0);
-    const refundedToday = refunds.reduce((s: number, r: any) => s + (r.amount ?? 0), 0);
-    const netProfit = revenue - (cogs._sum.unitCost ?? 0) - expToday - refundedToday;
-    await TelegramService.sendMessage(ctx.chatId, `<b>📊 Today's Summary</b>\n\nOrders: ${orders.length}\nRevenue: ${money(revenue.toFixed(2))}\nCOGS: ${money((cogs._sum.unitCost ?? 0).toFixed(2))}\nPayments Received: ${money(paidToday.toFixed(2))}\nExpenses: ${money(expToday.toFixed(2))}\nRefunds: ${money(refundedToday.toFixed(2))}\nNet Profit: ${money(netProfit.toFixed(2))}`);
+    // Use the centralized ProfitabilityService so the numbers match the
+    // dashboard and reports exactly. Previously this method re-implemented
+    // the P&L inline, which could drift from the canonical calculation.
+    const pnl = await ProfitabilityService.aggregate({ from: start, to: end });
+    const lowStock = await db.inventory.count({ where: { OR: [{ quantity: { lte: 0 } }, { reservedQuantity: { gt: 0 } }] } });
+    const text = `<b>📊 Today's Business Summary</b>\n\n` +
+      `Orders: ${pnl.orderCount}\n` +
+      `Sales: ${money(pnl.totalSales.toFixed(2))}\n` +
+      `Payments: ${money(pnl.paidTotal.toFixed(2))}\n` +
+      `Due: ${money(pnl.outstanding.toFixed(2))}\n\n` +
+      `COGS: ${money(pnl.cogs.toFixed(2))}\n` +
+      `Expenses: ${money(pnl.operatingExpenses.toFixed(2))}\n\n` +
+      `Gross Profit: ${money(pnl.grossProfit.toFixed(2))}\n` +
+      `Net Profit: ${money(pnl.netProfit.toFixed(2))}\n\n` +
+      `Low-Stock Items: ${lowStock}`;
+    await TelegramService.sendMessage(ctx.chatId, text);
   },
 
   async cmdSummary(ctx: CommandContext, _args: string[], lang: string) {
@@ -1295,10 +1311,195 @@ export const TelegramCommandService = {
 
   async cmdDashboard(ctx: CommandContext, _args: string[], lang: string) {
     if (!this.can(ctx, "dashboard:read") && !this.can(ctx, "reports:read")) return this.deny(ctx, lang);
-    const pnl = await AccountingService.profitAndLoss();
+    const pnl = await ProfitabilityService.aggregate();
     const lowStock = await db.inventory.count({ where: { OR: [{ quantity: { lte: 0 } }, { reservedQuantity: { gt: 0 } }] } });
-    const pendingOrders = await db.order.count({ where: { status: { in: ["PENDING", "CONFIRMED", "PROCESSING"] } } });
-    await TelegramService.sendMessage(ctx.chatId, `<b>🏠 Dashboard</b>\n\nRevenue: ${money(pnl.revenue.toFixed(2))}\nNet Profit: ${money(pnl.netProfit.toFixed(2))}\nPending Orders: ${pendingOrders}\nLow-Stock Items: ${lowStock}`);
+    const pendingOrders = await db.order.count({ where: { status: { in: ["PENDING", "CONFIRMED", "PROCESSING", "READY_TO_SHIP"] } } });
+    await TelegramService.sendMessage(ctx.chatId, `<b>🏠 Dashboard</b>\n\nRevenue: ${money(pnl.totalSales.toFixed(2))}\nNet Profit: ${money(pnl.netProfit.toFixed(2))}\nPending Orders: ${pendingOrders}\nLow-Stock Items: ${lowStock}`);
+  },
+
+  // ────────────────────────────────────────────────────────────────
+  // NEW: /profit today|week|month|YYYY-MM-DD YYYY-MM-DD
+  // Flexible date-range profit command. Parses the arg and delegates to
+  // ProfitabilityService.aggregate (the same service the dashboard uses).
+  // ────────────────────────────────────────────────────────────────
+  async cmdProfit(ctx: CommandContext, args: string[], lang: string) {
+    if (!this.can(ctx, "reports:read") && !this.can(ctx, "dashboard:read")) return this.deny(ctx, lang);
+    const range = this.parseDateRange(args);
+    if (!range) {
+      return TelegramService.sendMessage(ctx.chatId,
+        "Usage: /profit today | yesterday | week | month | lastmonth | YYYY-MM-DD YYYY-MM-DD\n\n" +
+        "Examples:\n" +
+        "  /profit today\n" +
+        "  /profit week\n" +
+        "  /profit month\n" +
+        "  /profit 2026-08-01 2026-08-28"
+      );
+    }
+    const pnl = await ProfitabilityService.aggregate(range);
+    const label = this.dateRangeLabel(args);
+    const text = `<b>📈 Profit & Loss — ${label}</b>\n\n` +
+      `Orders: ${pnl.orderCount}\n\n` +
+      `Gross Sales: ${money(pnl.grossSales.toFixed(2))}\n` +
+      `− Discounts: ${money(pnl.discounts.toFixed(2))}\n` +
+      `+ Tax: ${money(pnl.tax.toFixed(2))}\n` +
+      `+ Shipping Income: ${money(pnl.shippingIncome.toFixed(2))}\n` +
+      `+ Other Income: ${money(pnl.otherIncome.toFixed(2))}\n` +
+      `= Total Sales: ${money(pnl.totalSales.toFixed(2))}\n\n` +
+      `− COGS: ${money(pnl.cogs.toFixed(2))}\n` +
+      `= Gross Profit: ${money(pnl.grossProfit.toFixed(2))}\n\n` +
+      `− Packaging: ${money(pnl.packagingCost.toFixed(2))}\n` +
+      `− Payment Fees: ${money(pnl.paymentFee.toFixed(2))}\n` +
+      `− Platform Fees: ${money(pnl.platformFee.toFixed(2))}\n` +
+      `− Delivery Cost: ${money(pnl.deliveryCost.toFixed(2))}\n` +
+      `− Order Expenses: ${money(pnl.orderExpenses.toFixed(2))}\n` +
+      `− Operating Expenses: ${money(pnl.operatingExpenses.toFixed(2))}\n` +
+      `− Refunds: ${money(pnl.refunds.toFixed(2))}\n` +
+      `= Net Profit: ${money(pnl.netProfit.toFixed(2))}\n\n` +
+      `Payments Received: ${money(pnl.paidTotal.toFixed(2))}\n` +
+      `Outstanding (Due): ${money(pnl.outstanding.toFixed(2))}`;
+    await TelegramService.sendMessage(ctx.chatId, text);
+  },
+
+  // Parse /profit args into a DateRange. Returns null on invalid input.
+  // Supported: today, yesterday, week, month, lastmonth, YYYY-MM-DD [YYYY-MM-DD]
+  parseDateRange(args: string[]): { from?: Date; to?: Date } | null {
+    if (!args.length) return null;
+    const preset = args[0]?.toLowerCase();
+    const now = new Date();
+    if (preset === "today") {
+      const from = new Date(); from.setHours(0, 0, 0, 0);
+      const to = new Date(); to.setHours(23, 59, 59, 999);
+      return { from, to };
+    }
+    if (preset === "yesterday") {
+      const from = new Date(); from.setDate(from.getDate() - 1); from.setHours(0, 0, 0, 0);
+      const to = new Date(); to.setDate(to.getDate() - 1); to.setHours(23, 59, 59, 999);
+      return { from, to };
+    }
+    if (preset === "week") {
+      const from = new Date(); from.setDate(from.getDate() - 6); from.setHours(0, 0, 0, 0);
+      const to = new Date(); to.setHours(23, 59, 59, 999);
+      return { from, to };
+    }
+    if (preset === "month") {
+      const from = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0);
+      const to = new Date();
+      return { from, to };
+    }
+    if (preset === "lastmonth") {
+      const from = new Date(now.getFullYear(), now.getMonth() - 1, 1, 0, 0, 0, 0);
+      const to = new Date(now.getFullYear(), now.getMonth(), 0, 23, 59, 59, 999);
+      return { from, to };
+    }
+    // Try ISO date parsing: /profit 2026-08-01 2026-08-28
+    const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
+    if (dateRegex.test(args[0])) {
+      const from = new Date(args[0] + "T00:00:00");
+      if (args[1] && dateRegex.test(args[1])) {
+        const to = new Date(args[1] + "T23:59:59");
+        return { from, to };
+      }
+      // Single date → that day only
+      const to = new Date(args[0] + "T23:59:59");
+      return { from, to };
+    }
+    return null;
+  },
+
+  // Human-readable label for the date range, for the Telegram message header.
+  dateRangeLabel(args: string[]): string {
+    if (!args.length) return "All Time";
+    const preset = args[0]?.toLowerCase();
+    if (preset === "today") return "Today";
+    if (preset === "yesterday") return "Yesterday";
+    if (preset === "week") return "Last 7 Days";
+    if (preset === "month") return "This Month";
+    if (preset === "lastmonth") return "Last Month";
+    if (args.length >= 2) return `${args[0]} to ${args[1]}`;
+    if (args.length === 1) return args[0];
+    return "Custom Range";
+  },
+
+  // ────────────────────────────────────────────────────────────────
+  // NEW: /cogs — COGS breakdown for a date range
+  // ────────────────────────────────────────────────────────────────
+  async cmdCogs(ctx: CommandContext, args: string[], lang: string) {
+    if (!this.can(ctx, "reports:read") && !this.can(ctx, "dashboard:read")) return this.deny(ctx, lang);
+    const range = this.parseDateRange(args.length ? args : ["month"]);
+    const pnl = await ProfitabilityService.aggregate(range ?? undefined);
+    const label = this.dateRangeLabel(args.length ? args : ["month"]);
+    await TelegramService.sendMessage(ctx.chatId,
+      `<b>📦 COGS Report — ${label}</b>\n\n` +
+      `Orders: ${pnl.orderCount}\n` +
+      `Total Sales: ${money(pnl.totalSales.toFixed(2))}\n` +
+      `COGS: ${money(pnl.cogs.toFixed(2))}\n` +
+      `Gross Profit: ${money(pnl.grossProfit.toFixed(2))}\n` +
+      `Gross Margin: ${pnl.totalSales.gt(0) ? pnl.grossProfit.dividedBy(pnl.totalSales).times(100).toFixed(1) : "0"}%`
+    );
+  },
+
+  // ────────────────────────────────────────────────────────────────
+  // NEW: /sales — sales summary for a date range
+  // ────────────────────────────────────────────────────────────────
+  async cmdSales(ctx: CommandContext, args: string[], lang: string) {
+    if (!this.can(ctx, "reports:read") && !this.can(ctx, "dashboard:read")) return this.deny(ctx, lang);
+    const range = this.parseDateRange(args.length ? args : ["month"]);
+    const pnl = await ProfitabilityService.aggregate(range ?? undefined);
+    const label = this.dateRangeLabel(args.length ? args : ["month"]);
+    await TelegramService.sendMessage(ctx.chatId,
+      `<b>💰 Sales Report — ${label}</b>\n\n` +
+      `Orders: ${pnl.orderCount}\n` +
+      `Gross Sales: ${money(pnl.grossSales.toFixed(2))}\n` +
+      `− Discounts: ${money(pnl.discounts.toFixed(2))}\n` +
+      `+ Tax: ${money(pnl.tax.toFixed(2))}\n` +
+      `+ Shipping Income: ${money(pnl.shippingIncome.toFixed(2))}\n` +
+      `+ Other Income: ${money(pnl.otherIncome.toFixed(2))}\n` +
+      `= Total Sales: ${money(pnl.totalSales.toFixed(2))}\n\n` +
+      `Payments Received: ${money(pnl.paidTotal.toFixed(2))}\n` +
+      `Outstanding: ${money(pnl.outstanding.toFixed(2))}`
+    );
+  },
+
+  // ────────────────────────────────────────────────────────────────
+  // NEW: /duereport — customer due aging summary
+  // Shows total outstanding across all customers with aging buckets.
+  // ────────────────────────────────────────────────────────────────
+  async cmdDueReport(ctx: CommandContext, _args: string[], lang: string) {
+    if (!this.can(ctx, "reports:read") && !this.can(ctx, "customers:read")) return this.deny(ctx, lang);
+    // Aggregate outstanding across all customers via the same computeDue logic.
+    const customers = await db.customer.findMany({
+      where: { orders: { some: { status: { not: "CANCELLED" } } } },
+      include: { customerCredit: true },
+      take: 200, // bound the query
+    });
+    let totalDue = new Prisma.Decimal(0);
+    const aging = { "0-7": new Prisma.Decimal(0), "8-30": new Prisma.Decimal(0), "31-60": new Prisma.Decimal(0), "61-90": new Prisma.Decimal(0), "90+": new Prisma.Decimal(0) };
+    let customersWithDue = 0;
+    for (const c of customers) {
+      const due = await CustomerDueService.computeDue(c.id);
+      const dueAmt = toDecimal(due.totalDue);
+      if (dueAmt.gt(0)) {
+        customersWithDue++;
+        totalDue = totalDue.plus(dueAmt);
+        aging["0-7"] = aging["0-7"].plus(toDecimal(due.aging["0-7"]));
+        aging["8-30"] = aging["8-30"].plus(toDecimal(due.aging["8-30"]));
+        aging["31-60"] = aging["31-60"].plus(toDecimal(due.aging["31-60"]));
+        aging["61-90"] = aging["61-90"].plus(toDecimal(due.aging["61-90"]));
+        aging["90+"] = aging["90+"].plus(toDecimal(due.aging["90+"]));
+      }
+    }
+    await TelegramService.sendMessage(ctx.chatId,
+      `<b>💸 Customer Due Report</b>\n\n` +
+      `Customers with outstanding: ${customersWithDue}\n` +
+      `Total Outstanding: ${money(totalDue.toFixed(2))}\n\n` +
+      `<b>Aging:</b>\n` +
+      `0–7 days: ${money(aging["0-7"].toFixed(2))}\n` +
+      `8–30 days: ${money(aging["8-30"].toFixed(2))}\n` +
+      `31–60 days: ${money(aging["31-60"].toFixed(2))}\n` +
+      `61–90 days: ${money(aging["61-90"].toFixed(2))}\n` +
+      `90+ days: ${money(aging["90+"].toFixed(2))}\n\n` +
+      `Use /due to view per-customer details.`
+    );
   },
 
   // ────────────────────────────────────────────────────────────────
