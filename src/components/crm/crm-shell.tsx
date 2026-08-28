@@ -52,7 +52,7 @@ import { LeadPipelineView } from "./views/lead-pipeline";
 import { SalesPipelineView } from "./views/sales-pipeline";
 
 export function CRMShell() {
-  const { route, theme, setTheme } = useCrmStore();
+  const { route, theme, setTheme, navigate, user } = useCrmStore();
 
   // Initialize theme on mount
   useEffect(() => {
@@ -60,6 +60,44 @@ export function CRMShell() {
     const initial = saved || (typeof window !== "undefined" && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light") || "light";
     setTheme(initial);
   }, [setTheme]);
+
+  // Keyboard shortcuts — only fire when NOT typing in an input/textarea/select.
+  // Each shortcut checks RBAC before navigating.
+  useEffect(() => {
+    const can = (perm: string) => user?.permissions?.includes(perm as any) || user?.role === "SUPER_ADMIN" || user?.role === "ADMIN";
+
+    const handler = (e: KeyboardEvent) => {
+      // Don't trigger inside form fields
+      const target = e.target as HTMLElement;
+      if (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT" || target.isContentEditable) return;
+
+      // Don't trigger with modifier keys (Ctrl/Cmd/Alt)
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+
+      switch (e.key.toLowerCase()) {
+        case "n":
+          if (can("orders:create")) { e.preventDefault(); navigate("orders/new"); }
+          break;
+        case "p":
+          if (can("products:create")) { e.preventDefault(); navigate("products"); }
+          break;
+        case "c":
+          if (can("customers:create")) { e.preventDefault(); navigate("customers"); }
+          break;
+        case "e":
+          if (can("expenses:create")) { e.preventDefault(); navigate("expenses"); }
+          break;
+        case "/":
+          e.preventDefault();
+          const searchInput = document.querySelector<HTMLInputElement>('input[placeholder*="Search"]');
+          if (searchInput) searchInput.focus();
+          break;
+      }
+    };
+
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [navigate, user]);
 
   return (
     <div className="flex h-screen overflow-hidden bg-background app-bg">

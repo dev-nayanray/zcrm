@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import { useCrmStore } from "@/lib/store";
 import { api } from "@/lib/api-client";
 import { Button } from "@/components/ui/button";
@@ -15,6 +15,28 @@ export function Topbar() {
   const [notifOpen, setNotifOpen] = useState(false);
   const [notifications, setNotifications] = useState<{ id: string; title: string; message: string; isRead: boolean; link?: string }[]>([]);
   const [unread, setUnread] = useState(0);
+
+  // Global search state
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState<{ label: string; items: { type: string; id: string; label: string; subtitle: string; route: string; meta?: string }[] }[]>([]);
+  const [searchLoading, setSearchLoading] = useState(false);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const searchInputRef = useRef<HTMLDivElement | null>(null);
+
+  // Debounced global search
+  useEffect(() => {
+    if (searchQuery.length < 2) { setSearchResults([]); setSearchOpen(false); return; }
+    setSearchLoading(true);
+    const timer = setTimeout(async () => {
+      try {
+        const res = await api.get<{ query: string; groups: typeof searchResults }>(`/api/v1/search?q=${encodeURIComponent(searchQuery)}&limit=5`);
+        setSearchResults(res.groups);
+        setSearchOpen(true);
+      } catch { setSearchResults([]); }
+      finally { setSearchLoading(false); }
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [searchQuery]);
 
   useEffect(() => {
     let cancelled = false;
@@ -70,20 +92,53 @@ export function Topbar() {
         <Button variant="ghost" size="icon" className="md:hidden hover:bg-accent" onClick={() => setSidebarOpen(!sidebarOpen)}>
           <Menu className="h-5 w-5" />
         </Button>
-        <div className="hidden sm:flex flex-1 max-w-md relative">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground pointer-events-none" />
+        <div className="hidden sm:flex flex-1 max-w-md relative" ref={searchInputRef}>
+          <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground pointer-events-none z-10" />
           <Input
             placeholder="Search customers, products, orders…"
             className="pl-9 h-9 bg-muted/50 border-transparent focus-visible:bg-card"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter") {
-                const q = (e.target as HTMLInputElement).value.trim();
-                if (!q) return;
-                navigate("orders", { search: q });
+              if (e.key === "Escape") { setSearchOpen(false); setSearchQuery(""); (e.target as HTMLInputElement).blur(); }
+              if (e.key === "Enter" && searchResults.length > 0) {
+                const firstItem = searchResults[0].items[0];
+                if (firstItem) { navigate(firstItem.route as any, { id: firstItem.id }); setSearchOpen(false); setSearchQuery(""); }
               }
             }}
+            onFocus={() => { if (searchResults.length > 0) setSearchOpen(true); }}
           />
           <kbd className="hidden lg:inline-flex absolute right-3 top-1/2 -translate-y-1/2 items-center gap-0.5 rounded border border-border/60 bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground pointer-events-none">⏎</kbd>
+
+          {/* Global search results dropdown */}
+          {searchOpen && searchQuery.length >= 2 && (
+            <div className="absolute top-full left-0 right-0 mt-1 rounded-xl border border-border/80 bg-card shadow-pop overflow-hidden z-50 max-h-96 overflow-y-auto">
+              {searchLoading ? (
+                <div className="py-6 text-center text-sm text-muted-foreground">Searching…</div>
+              ) : searchResults.length === 0 ? (
+                <div className="py-6 text-center text-sm text-muted-foreground">No results for "{searchQuery}"</div>
+              ) : (
+                searchResults.map((group) => (
+                  <div key={group.label}>
+                    <p className="px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground bg-muted/40">{group.label}</p>
+                    {group.items.map((item) => (
+                      <button
+                        key={item.id}
+                        onClick={() => { navigate(item.route as any, { id: item.id }); setSearchOpen(false); setSearchQuery(""); }}
+                        className="w-full flex items-center justify-between gap-2 px-3 py-2 hover:bg-accent text-sm text-left transition-colors"
+                      >
+                        <div className="min-w-0">
+                          <div className="font-medium truncate">{item.label}</div>
+                          <div className="text-xs text-muted-foreground truncate">{item.subtitle}</div>
+                        </div>
+                        {item.meta && <span className="text-[10px] text-muted-foreground shrink-0">{item.meta}</span>}
+                      </button>
+                    ))}
+                  </div>
+                ))
+              )}
+            </div>
+          )}
         </div>
         <div className="flex-1 sm:hidden" />
 
