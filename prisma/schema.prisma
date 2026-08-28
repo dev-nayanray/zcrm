@@ -836,12 +836,17 @@ model AuditLog {
   entityId  String?
   changes   String?  // JSON diff
   ipAddress String?
+  // Origin channel — answers "where did this action come from?". One of:
+  // WEB | WOOCOMMERCE | TELEGRAM | API | SYSTEM (cron/automation).
+  // Null for legacy entries created before the field was added.
+  source    String?
   createdAt DateTime @default(now())
 
   @@index([userId])
   @@index([action])
   @@index([entity, entityId])
   @@index([createdAt])
+  @@index([source])
 }
 
 model Setting {

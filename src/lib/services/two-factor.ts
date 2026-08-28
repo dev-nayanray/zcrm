@@ -142,7 +142,7 @@ export const TwoFactorService = {
     return { ok: true, challengeToken: challenge.id };
   },
 
-  async resendLoginChallenge(challengeToken: string) {
+  async resendLoginChallenge(challengeToken: string): Promise<{ ok: true; challengeToken: string } | { ok: false; message: string }> {
     const existing = await db.twoFactorChallenge.findUnique({ where: { id: challengeToken } });
     if (!existing || existing.consumed) return { ok: false, message: "Verification session expired. Please log in again." };
     await db.twoFactorChallenge.update({ where: { id: challengeToken }, data: { consumed: true } });

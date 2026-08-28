@@ -1,0 +1,8 @@
+{
+  "crons": [
+    {
+      "path": "/api/cron/woocommerce-retry",
+      "schedule": "*/5 * * * *"
+    }
+  ]
+}

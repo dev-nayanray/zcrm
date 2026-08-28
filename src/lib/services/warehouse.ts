@@ -67,7 +67,7 @@ async function getOrCreateWarehouseStock(
   });
   if (!ws) {
     ws = await tx.warehouseStock.create({
-      data: { warehouseId, productId, quantity: new Prisma.Decimal(0) },
+      data: { warehouseId, productId, quantity: 0 },
     });
   }
   return ws;
@@ -122,7 +122,7 @@ export const StockTransferService = {
           status: "COMPLETED",
           notes: input.notes,
           createdBy: user?.id,
-          items: { create: input.items.map((i) => ({ productId: i.productId, quantity: new Prisma.Decimal(String(i.quantity)) })) },
+          items: { create: input.items.map((i) => ({ productId: i.productId, quantity: new Prisma.Decimal(String(i.quantity)).toNumber() })) },
         },
         include: { items: true },
       });

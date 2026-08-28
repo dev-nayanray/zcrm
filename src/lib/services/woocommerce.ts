@@ -839,6 +839,233 @@ export const WooCommerceService = {
     throw new Error(`Cannot retry sync log with operation ${log.operation} — re-trigger from source system`);
   },
 
+  // ─────────────────────────────────────────────────────────────────────
+  // AUTOMATED RETRY WORKER
+  //
+  // Called by the Vercel Cron route (/api/cron/woocommerce-retry, every 5
+  // minutes) and by the manual "Retry all failed" admin button. Safely
+  // claims a batch of FAILED SyncLog rows whose nextRetryAt has elapsed,
+  // retries each one, and records the outcome.
+  //
+  // LOCK SEMANTICS:
+  //   We use an atomic updateMany to "claim" rows — flipping status from
+  //   FAILED to RETRYING in a single query so two concurrent cron
+  //   invocations don't double-process the same row. If the retry succeeds,
+  //   status becomes SUCCESS. If it fails, status goes back to FAILED with
+  //   an updated nextRetryAt (exponential backoff) — unless maxAttempts is
+  //   reached, in which case status becomes FAILED with nextRetryAt=null
+  //   (permanently failed, won't be picked up again).
+  // ─────────────────────────────────────────────────────────────────────
+  async claimAndRetryFailed(opts: { limit?: number } = {}): Promise<{ claimed: number; succeeded: number; failed: number; permanentlyFailed: number }> {
+    const limit = Math.min(opts.limit ?? 20, 50); // cap at 50 per run
+
+    // Claim: atomically flip FAILED → RETRYING for rows due for retry.
+    // The `nextRetryAt <= now()` condition is what makes this safe — a row
+    // that just failed won't be re-claimed until its backoff window passes.
+    const now = new Date();
+    const claimed = await db.syncLog.updateMany({
+      where: {
+        status: "FAILED",
+        nextRetryAt: { lte: now },
+        attemptCount: { lt: 5 }, // maxAttempts = 5 (matches upsertSyncLog backoff schedule)
+      },
+      data: { status: "RETRYING" },
+    });
+
+    if (claimed.count === 0) {
+      return { claimed: 0, succeeded: 0, failed: 0, permanentlyFailed: 0 };
+    }
+
+    // Fetch the claimed rows (capped at `limit`).
+    const rows = await db.syncLog.findMany({
+      where: { status: "RETRYING" },
+      take: limit,
+      orderBy: { nextRetryAt: "asc" },
+    });
+
+    let succeeded = 0;
+    let failed = 0;
+    let permanentlyFailed = 0;
+
+    for (const row of rows) {
+      try {
+        await this.retrySyncLog(row.id);
+        // Success — mark the row.
+        await db.syncLog.update({
+          where: { id: row.id },
+          data: { status: "SUCCESS", nextRetryAt: null, lastErrorAt: null, message: `Retried successfully (attempt ${row.attemptCount + 1})` },
+        });
+        succeeded++;
+      } catch (e) {
+        const errorMsg = (e as Error).message;
+        const newAttemptCount = row.attemptCount + 1;
+        // Exponential backoff: 1m, 5m, 25m, 2h, 10h.
+        const backoffMs = [60_000, 300_000, 1_500_000, 7_200_000, 36_000_000];
+        const isPermanent = newAttemptCount >= 5;
+        const nextRetryAt = isPermanent ? null : new Date(Date.now() + backoffMs[Math.min(newAttemptCount, backoffMs.length - 1)]);
+        await db.syncLog.update({
+          where: { id: row.id },
+          data: {
+            status: "FAILED",
+            message: errorMsg,
+            lastErrorAt: new Date(),
+            nextRetryAt,
+            // Reset attemptCount only if permanent — otherwise increment.
+            attemptCount: isPermanent ? newAttemptCount : { increment: 1 },
+          },
+        });
+        if (isPermanent) {
+          permanentlyFailed++;
+          // Audit the permanent failure so it's visible in the dashboard.
+          await AuditService.log({
+            userId: null,
+            action: "WOOCOMMERCE_SYNC_PERMANENT_FAILURE",
+            entity: "SyncLog",
+            entityId: row.id,
+            changes: { entity: row.entity, externalId: row.externalId, operation: row.operation, attempts: newAttemptCount, lastError: errorMsg },
+          });
+        } else {
+          failed++;
+        }
+      }
+    }
+
+    return { claimed: claimed.count, succeeded, failed, permanentlyFailed };
+  },
+
+  // ─────────────────────────────────────────────────────────────────────
+  // RECONCILIATION
+  //
+  // Compares Z-CRM's records against WooCommerce's current state and reports
+  // differences. Does NOT modify any data — the caller (admin dashboard)
+  // decides what to resync.
+  //
+  // Result categories per entity:
+  //   MATCHED   — CRM record exists, Woo record exists, fields agree
+  //   CRM_ONLY  — CRM record exists, Woo has no matching record (deleted on Woo?)
+  //   WOO_ONLY  — Woo record exists, CRM has no matching record (sync missed)
+  //   DIFFERENT — both exist but key fields disagree (price, stock, status)
+  //   ERROR     — couldn't fetch from Woo (auth, network, etc.)
+  // ─────────────────────────────────────────────────────────────────────
+  async reconcileProducts(opts: { limit?: number } = {}): Promise<{
+    matched: number; crmOnly: number; wooOnly: number; different: number; error?: string;
+    details: { externalId: string; sku: string; status: "MATCHED" | "CRM_ONLY" | "WOO_ONLY" | "DIFFERENT" | "ERROR"; differences?: string[] }[];
+  }> {
+    const cfg = await this.getConfig();
+    if (!cfg) return { matched: 0, crmOnly: 0, wooOnly: 0, different: 0, error: "WooCommerce not configured", details: [] };
+
+    // Fetch all Woo products (paginate).
+    const wooProducts = new Map<string, { id: number; sku?: string; regular_price?: string; sale_price?: string; stock_quantity?: number | null; status?: string }>();
+    let page = 1;
+    while (page <= 10) { // cap at 10 pages = 1000 products
+      const url = this.buildUrl(cfg, "/products", { per_page: 100, page });
+      const res = await fetch(url);
+      if (!res.ok) return { matched: 0, crmOnly: 0, wooOnly: 0, different: 0, error: `Woo fetch failed: HTTP ${res.status}`, details: [] };
+      const items = (await res.json()) as any[];
+      if (!items.length) break;
+      for (const p of items) wooProducts.set(String(p.id), p);
+      if (items.length < 100) break;
+      page++;
+    }
+
+    // Fetch all CRM products with externalId.
+    const crmProducts = await db.product.findMany({
+      where: { externalId: { not: null } },
+      take: opts.limit ?? 1000,
+    });
+
+    const details: { externalId: string; sku: string; status: "MATCHED" | "CRM_ONLY" | "WOO_ONLY" | "DIFFERENT" | "ERROR"; differences?: string[] }[] = [];
+    let matched = 0, crmOnly = 0, different = 0;
+
+    // Check CRM products against Woo.
+    for (const crm of crmProducts) {
+      const extId = crm.externalId!;
+      const woo = wooProducts.get(extId);
+      if (!woo) {
+        crmOnly++;
+        details.push({ externalId: extId, sku: crm.sku, status: "CRM_ONLY" });
+        continue;
+      }
+      wooProducts.delete(extId); // remove from Woo map; remaining = WOO_ONLY
+      // Compare key fields.
+      const diffs: string[] = [];
+      const wooPrice = toDecimal(woo.sale_price || woo.regular_price || 0).toNumber();
+      if (Math.abs(wooPrice - crm.sellingPrice) > 0.01) diffs.push(`price: CRM=${crm.sellingPrice} Woo=${wooPrice}`);
+      const wooStatus = woo.status === "draft" ? "INACTIVE" : "ACTIVE";
+      if (wooStatus !== crm.status) diffs.push(`status: CRM=${crm.status} Woo=${wooStatus}`);
+      if (diffs.length > 0) {
+        different++;
+        details.push({ externalId: extId, sku: crm.sku, status: "DIFFERENT", differences: diffs });
+      } else {
+        matched++;
+        details.push({ externalId: extId, sku: crm.sku, status: "MATCHED" });
+      }
+    }
+    // Remaining Woo products = WOO_ONLY.
+    const wooOnly = wooProducts.size;
+    for (const [extId, woo] of wooProducts) {
+      details.push({ externalId: extId, sku: woo.sku ?? `WOO-${extId}`, status: "WOO_ONLY" });
+    }
+
+    return { matched, crmOnly, wooOnly, different, details };
+  },
+
+  async reconcileOrders(opts: { limit?: number } = {}): Promise<{
+    matched: number; crmOnly: number; wooOnly: number; different: number; error?: string;
+    details: { externalId: string; status: "MATCHED" | "CRM_ONLY" | "WOO_ONLY" | "DIFFERENT" | "ERROR"; differences?: string[] }[];
+  }> {
+    const cfg = await this.getConfig();
+    if (!cfg) return { matched: 0, crmOnly: 0, wooOnly: 0, different: 0, error: "WooCommerce not configured", details: [] };
+
+    const wooOrders = new Map<string, { id: number; status: string; total: string; payment_method?: string }>();
+    let page = 1;
+    while (page <= 10) {
+      const url = this.buildUrl(cfg, "/orders", { per_page: 100, page });
+      const res = await fetch(url);
+      if (!res.ok) return { matched: 0, crmOnly: 0, wooOnly: 0, different: 0, error: `Woo fetch failed: HTTP ${res.status}`, details: [] };
+      const items = (await res.json()) as any[];
+      if (!items.length) break;
+      for (const o of items) wooOrders.set(String(o.id), o);
+      if (items.length < 100) break;
+      page++;
+    }
+
+    const crmOrders = await db.order.findMany({
+      where: { externalId: { not: null } },
+      take: opts.limit ?? 1000,
+    });
+
+    const details: { externalId: string; status: "MATCHED" | "CRM_ONLY" | "WOO_ONLY" | "DIFFERENT" | "ERROR"; differences?: string[] }[] = [];
+    let matched = 0, crmOnly = 0, different = 0;
+
+    for (const crm of crmOrders) {
+      const extId = crm.externalId!;
+      const woo = wooOrders.get(extId);
+      if (!woo) {
+        crmOnly++;
+        details.push({ externalId: extId, status: "CRM_ONLY" });
+        continue;
+      }
+      wooOrders.delete(extId);
+      const diffs: string[] = [];
+      const wooCrmStatus = WOO_TO_CRM_STATUS[woo.status] ?? "";
+      if (wooCrmStatus && wooCrmStatus !== crm.status) diffs.push(`status: CRM=${crm.status} Woo=${wooCrmStatus} (${woo.status})`);
+      const wooTotal = toDecimal(woo.total || 0).toNumber();
+      if (Math.abs(wooTotal - crm.total) > 0.01) diffs.push(`total: CRM=${crm.total} Woo=${wooTotal}`);
+      if (diffs.length > 0) {
+        different++;
+        details.push({ externalId: extId, status: "DIFFERENT", differences: diffs });
+      } else {
+        matched++;
+        details.push({ externalId: extId, status: "MATCHED" });
+      }
+    }
+    const wooOnly = wooOrders.size;
+    for (const [extId] of wooOrders) details.push({ externalId: extId, status: "WOO_ONLY" });
+
+    return { matched, crmOnly, wooOnly, different, details };
+  },
+
   async listSyncLogs(opts: { page: number; limit: number; entity?: string; status?: string }) {
     const where: Record<string, unknown> = { AND: [] };
     const and: Record<string, unknown>[] = [];

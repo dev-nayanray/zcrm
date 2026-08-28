@@ -33,12 +33,13 @@ async function getOrCreateInventory(tx: TxClient, productId: string) {
     inv = await tx.inventory.create({
       data: {
         productId,
-        quantity: new Prisma.Decimal(0),
-        reservedQuantity: new Prisma.Decimal(0),
-        damagedQuantity: new Prisma.Decimal(0),
-        minimumStock: new Prisma.Decimal(0),
-        maximumStock: new Prisma.Decimal(0),
-        reorderLevel: new Prisma.Decimal(0),
+        // Schema stores Float — use plain numbers, not Prisma.Decimal.
+        quantity: 0,
+        reservedQuantity: 0,
+        damagedQuantity: 0,
+        minimumStock: 0,
+        maximumStock: 0,
+        reorderLevel: 0,
       },
     });
   }
@@ -65,15 +66,15 @@ async function applyMovementInTx(tx: TxClient, input: MovementInput, opts?: { al
     const newReserved = previousReserved.plus(change);
     const updated = await tx.inventory.update({
       where: { productId: input.productId },
-      data: { reservedQuantity: newReserved },
+      data: { reservedQuantity: newReserved.toNumber() },
     });
     const movement = await tx.stockMovement.create({
       data: {
         productId: input.productId,
         type: input.type,
-        quantityChange: change,
-        previousQuantity: previous,
-        newQuantity: previous, // physical unchanged
+        quantityChange: change.toNumber(),
+        previousQuantity: previous.toNumber(),
+        newQuantity: previous.toNumber(), // physical unchanged
         referenceType: input.referenceType,
         referenceId: input.referenceId,
         reason: input.reason,
@@ -95,15 +96,15 @@ async function applyMovementInTx(tx: TxClient, input: MovementInput, opts?: { al
     const newReserved = previousReserved.minus(actualChange);
     const updated = await tx.inventory.update({
       where: { productId: input.productId },
-      data: { reservedQuantity: newReserved },
+      data: { reservedQuantity: newReserved.toNumber() },
     });
     const movement = await tx.stockMovement.create({
       data: {
         productId: input.productId,
         type: input.type,
-        quantityChange: actualChange.negated(),
-        previousQuantity: previous,
-        newQuantity: previous,
+        quantityChange: actualChange.negated().toNumber(),
+        previousQuantity: previous.toNumber(),
+        newQuantity: previous.toNumber(),
         referenceType: input.referenceType,
         referenceId: input.referenceId,
         reason: input.reason,
@@ -124,15 +125,15 @@ async function applyMovementInTx(tx: TxClient, input: MovementInput, opts?: { al
     }
     const updated = await tx.inventory.update({
       where: { productId: input.productId },
-      data: { damagedQuantity: previousDamaged.plus(change) },
+      data: { damagedQuantity: previousDamaged.plus(change).toNumber() },
     });
     const movement = await tx.stockMovement.create({
       data: {
         productId: input.productId,
         type: input.type,
-        quantityChange: change,
-        previousQuantity: previous,
-        newQuantity: previous, // physical unchanged
+        quantityChange: change.toNumber(),
+        previousQuantity: previous.toNumber(),
+        newQuantity: previous.toNumber(), // physical unchanged
         referenceType: input.referenceType,
         referenceId: input.referenceId,
         reason: input.reason,
@@ -157,14 +158,14 @@ async function applyMovementInTx(tx: TxClient, input: MovementInput, opts?: { al
     }
     const updated = await tx.inventory.update({
       where: { productId: input.productId },
-      data: { quantity: previous.minus(change), damagedQuantity: previousDamaged.plus(change) },
+      data: { quantity: previous.minus(change).toNumber(), damagedQuantity: previousDamaged.plus(change).toNumber() },
     });
     const movement = await tx.stockMovement.create({
       data: {
         productId: input.productId,
         type: input.type,
-        quantityChange: change.negated(),
-        previousQuantity: previous,
+        quantityChange: change.negated().toNumber(),
+        previousQuantity: previous.toNumber(),
         newQuantity: updated.quantity,
         referenceType: input.referenceType,
         referenceId: input.referenceId,
@@ -183,15 +184,15 @@ async function applyMovementInTx(tx: TxClient, input: MovementInput, opts?: { al
   }
   const updated = await tx.inventory.update({
     where: { productId: input.productId },
-    data: { quantity: next },
+    data: { quantity: next.toNumber() },
   });
   const movement = await tx.stockMovement.create({
     data: {
       productId: input.productId,
       type: input.type,
-      quantityChange: change,
-      previousQuantity: previous,
-      newQuantity: next,
+      quantityChange: change.toNumber(),
+      previousQuantity: previous.toNumber(),
+      newQuantity: next.toNumber(),
       referenceType: input.referenceType,
       referenceId: input.referenceId,
       reason: input.reason,
@@ -317,7 +318,7 @@ export const InventoryService = {
     let inv = await db.inventory.findUnique({ where: { productId } });
     if (!inv) {
       inv = await db.inventory.create({
-        data: { productId, quantity: new Prisma.Decimal(0), damagedQuantity: new Prisma.Decimal(0) },
+        data: { productId, quantity: 0, damagedQuantity: 0 },
       });
     }
     return inv;
@@ -365,10 +366,16 @@ export const InventoryService = {
     return { items, total };
   },
 
-  /** Stock valuation + inventory dashboard aggregates. */
+  /** Stock valuation + inventory dashboard aggregates.
+   *
+   * Uses `Product.weightedAverageCost` (WAC) for the cost basis — matches
+   * the COGS basis used in `OrderItem.unitCost` snapshots. Falls back to
+   * `purchasePrice` for products seeded before WAC was implemented (back-
+   * compat). This keeps inventory valuation consistent with profit reporting.
+   */
   async stockValue() {
     const rows = await db.inventory.findMany({
-      include: { product: { select: { purchasePrice: true, sellingPrice: true, name: true, sku: true, minimumStockLevel: true, status: true } } },
+      include: { product: { select: { purchasePrice: true, weightedAverageCost: true, sellingPrice: true, name: true, sku: true, minimumStockLevel: true, status: true } } },
     });
     let totalCost = new Prisma.Decimal(0);
     let totalRetail = new Prisma.Decimal(0);
@@ -379,14 +386,18 @@ export const InventoryService = {
       const qty = toDecimal(r.quantity);
       const reserved = toDecimal(r.reservedQuantity);
       const damaged = toDecimal(r.damagedQuantity);
-      const cost = toDecimal(r.product.purchasePrice);
+      // Cost basis: prefer WAC; fall back to purchasePrice for legacy products.
+      const wac = toDecimal(r.product.weightedAverageCost);
+      const cost = wac.gt(0) ? wac : toDecimal(r.product.purchasePrice);
       const retail = toDecimal(r.product.sellingPrice);
-      totalCost = totalCost.plus(qty.times(cost));
-      totalRetail = totalRetail.plus(qty.times(retail));
+      // Inventory value = AVAILABLE quantity × WAC (reserved stock is still
+      // owned by us but committed; damaged stock is written off separately).
+      const available = qty.minus(reserved);
+      totalCost = totalCost.plus(available.times(cost));
+      totalRetail = totalRetail.plus(available.times(retail));
       totalUnits = totalUnits.plus(qty);
       totalReserved = totalReserved.plus(reserved);
       totalDamaged = totalDamaged.plus(damaged);
-      const available = qty.minus(reserved);
       return {
         productId: r.productId,
         name: r.product.name,
@@ -398,8 +409,11 @@ export const InventoryService = {
         minimumStock: toDecimal(r.minimumStock).toFixed(0),
         maximumStock: toDecimal(r.maximumStock).toFixed(0),
         reorderLevel: toDecimal(r.reorderLevel).toFixed(0),
-        costValue: qty.times(cost).toFixed(2),
-        retailValue: qty.times(retail).toFixed(2),
+        // WAC per unit (falls back to purchasePrice for display).
+        wac: cost.toFixed(2),
+        // Inventory value = available × WAC.
+        costValue: available.times(cost).toFixed(2),
+        retailValue: available.times(retail).toFixed(2),
         stockStatus: available.lte(0) ? "OUT_OF_STOCK" : (toDecimal(r.reorderLevel).gt(0) && available.lte(toDecimal(r.reorderLevel))) ? "LOW_STOCK" : (toDecimal(r.minimumStock).gt(0) && available.lte(toDecimal(r.minimumStock))) ? "LOW_STOCK" : "HEALTHY",
       };
     });

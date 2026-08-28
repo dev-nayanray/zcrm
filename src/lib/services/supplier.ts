@@ -46,7 +46,7 @@ export const SupplierService = {
       // supplier and is in RECEIVED status, and that the payment does not
       // exceed the due amount. This prevents cross-supplier confusion,
       // paying for un-received or cancelled purchases, and overpaying.
-      let purchase: { id: string; supplierId: string; status: string; paidAmount: Prisma.Decimal; dueAmount: Prisma.Decimal; total: Prisma.Decimal } | null = null;
+      let purchase: { id: string; supplierId: string; status: string; paidAmount: number; dueAmount: number; total: number } | null = null;
       if (data.purchaseId) {
         purchase = await tx.purchase.findUnique({ where: { id: data.purchaseId } });
         if (!purchase) throw new Error("Purchase not found");
@@ -62,7 +62,7 @@ export const SupplierService = {
       }
 
       const payment = await tx.supplierPayment.create({
-        data: { supplierId: data.supplierId, purchaseId: data.purchaseId, amount, method: data.method, transactionReference: data.transactionReference, notes: data.notes, createdBy: user?.id },
+        data: { supplierId: data.supplierId, purchaseId: data.purchaseId, amount: amount.toNumber(), method: data.method, transactionReference: data.transactionReference, notes: data.notes, createdBy: user?.id },
       });
       // Reduce the linked purchase's dueAmount / increase paidAmount.
       if (purchase) {
@@ -70,7 +70,7 @@ export const SupplierService = {
         const newDue = toDecimal(purchase.dueAmount).minus(amount);
         let paymentStatus: "PARTIAL" | "PAID" = "PARTIAL";
         if (newPaid.gte(toDecimal(purchase.total)) && toDecimal(purchase.total).gt(0)) paymentStatus = "PAID";
-        await tx.purchase.update({ where: { id: purchase.id }, data: { paidAmount: newPaid, dueAmount: newDue, paymentStatus } });
+        await tx.purchase.update({ where: { id: purchase.id }, data: { paidAmount: newPaid.toNumber(), dueAmount: newDue.toNumber(), paymentStatus } });
       }
       await AuditService.log({ userId: user?.id, action: "SUPPLIER_PAYMENT", entity: "SupplierPayment", entityId: payment.id, changes: { supplierId: data.supplierId, purchaseId: data.purchaseId, amount: amount.toFixed(2) } }, tx);
       return payment;

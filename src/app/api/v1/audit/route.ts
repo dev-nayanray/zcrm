@@ -13,7 +13,8 @@ export async function GET(request: NextRequest) {
     const entity = request.nextUrl.searchParams.get("entity") || undefined;
     const action = request.nextUrl.searchParams.get("action") || undefined;
     const userId = request.nextUrl.searchParams.get("userId") || undefined;
-    const { items, total } = await AuditService.list({ page: q.page, limit: q.limit, search: q.search, entity, action, userId });
+    const source = request.nextUrl.searchParams.get("source") || undefined;
+    const { items, total } = await AuditService.list({ page: q.page, limit: q.limit, search: q.search, entity, action, userId, source });
     return ok({
       items: items.map((i) => ({ ...i, changes: i.changes ? (() => { try { return JSON.parse(i.changes); } catch { return i.changes; } })() : null })),
       total,

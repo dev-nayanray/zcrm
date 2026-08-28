@@ -47,7 +47,7 @@ export const StockReconciliationService = {
             const inv = await db.inventory.findUnique({ where: { productId: it.productId } });
             const sys = toDecimal(inv?.quantity ?? 0);
             const counted = toDecimal(it.countedQuantity);
-            return { productId: it.productId, systemQuantity: sys, countedQuantity: counted, difference: counted.minus(sys) };
+            return { productId: it.productId, systemQuantity: sys.toNumber(), countedQuantity: counted.toNumber(), difference: counted.minus(sys).toNumber() };
           })),
         } : undefined,
       },
@@ -63,8 +63,8 @@ export const StockReconciliationService = {
     const counted = toDecimal(countedQuantity);
     return db.stockCountItem.upsert({
       where: { stockCountId_productId: { stockCountId, productId } },
-      create: { stockCountId, productId, systemQuantity: sys, countedQuantity: counted, difference: counted.minus(sys) },
-      update: { countedQuantity: counted, difference: counted.minus(sys) },
+      create: { stockCountId, productId, systemQuantity: sys.toNumber(), countedQuantity: counted.toNumber(), difference: counted.minus(sys).toNumber() },
+      update: { countedQuantity: counted.toNumber(), difference: counted.minus(sys).toNumber() },
     });
   },
 

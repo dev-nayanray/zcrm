@@ -56,6 +56,16 @@ async function broadcastCrmUpdate(opts: { userId?: string | null; action: string
 // When called from inside a service transaction, pass the `tx` client so the
 // audit write happens in the SAME transaction — this avoids SQLite write-lock
 // deadlocks that would occur if we opened a separate transaction mid-flight.
+//
+// SOURCE FIELD (Phase 4):
+//   Every audit log can now record where the action originated:
+//     WEB          — web dashboard (default when a session user is present)
+//     WOOCOMMERCE  — WooCommerce webhook / sync
+//     TELEGRAM     — Telegram bot command
+//     API          — direct API call (no session, e.g. external integration)
+//     SYSTEM       — cron worker / automation / internal service
+//   Callers should pass `source` explicitly so the audit trail can answer
+//   "did this ORDER_CREATE come from the web, a webhook, or Telegram?".
 export const AuditService = {
   async log(
     opts: {
@@ -65,6 +75,7 @@ export const AuditService = {
       entityId?: string | null;
       changes?: unknown;
       ipAddress?: string | null;
+      source?: string | null; // WEB | WOOCOMMERCE | TELEGRAM | API | SYSTEM
     },
     tx?: TxClient,
   ) {
@@ -78,6 +89,7 @@ export const AuditService = {
           entityId: opts.entityId ?? null,
           changes: opts.changes ? JSON.stringify(opts.changes) : null,
           ipAddress: opts.ipAddress ?? null,
+          source: opts.source ?? null,
         },
       });
       // Only broadcast outside a transaction: inside one, the write could
@@ -100,11 +112,13 @@ export const AuditService = {
   },
 
   // Convenience: log using the current session user (standalone transaction).
+  // Defaults source to "WEB" (callers can override).
   async logFromRequest(opts: {
     action: string;
     entity: string;
     entityId?: string | null;
     changes?: unknown;
+    source?: string | null;
   }) {
     const user = await getCurrentUser();
     return AuditService.log({
@@ -114,11 +128,12 @@ export const AuditService = {
       entityId: opts.entityId,
       changes: opts.changes,
       ipAddress: null,
+      source: opts.source ?? "WEB",
     });
   },
 
-  async list(opts: { page: number; limit: number; search?: string; entity?: string; action?: string; userId?: string }) {
-    const { page, limit, search, entity, action, userId } = opts;
+  async list(opts: { page: number; limit: number; search?: string; entity?: string; action?: string; userId?: string; source?: string }) {
+    const { page, limit, search, entity, action, userId, source } = opts;
     const where: Record<string, unknown> = { AND: [] };
     const and: Record<string, unknown>[] = [];
     if (search) {
@@ -133,6 +148,7 @@ export const AuditService = {
     if (entity) and.push({ entity });
     if (action) and.push({ action });
     if (userId) and.push({ userId });
+    if (source) and.push({ source });
     where.AND = and;
     const [items, total] = await Promise.all([
       db.auditLog.findMany({

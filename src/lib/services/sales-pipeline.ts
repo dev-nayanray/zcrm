@@ -34,7 +34,7 @@ export const SalesPipelineService = {
       data: {
         customerId: data.customerId,
         conversationId: data.conversationId,
-        value: toDecimal(data.value ?? 0),
+        value: toDecimal(data.value ?? 0).toNumber(),
         stage: data.stage ?? "NEW",
         expectedCloseDate: data.expectedCloseDate,
         assignedToId: data.assignedToId,

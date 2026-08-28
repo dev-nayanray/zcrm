@@ -55,7 +55,7 @@ export const BillingService = {
           orderNumber,
           userId,
           plan,
-          amount,
+          amount: amount.toNumber(),
           method,
           gatewayId: gatewayId ?? null,
           payerNumber,
@@ -78,7 +78,7 @@ export const BillingService = {
             userId,
             plan,
             status: "TRIALING",
-            amount,
+            amount: amount.toNumber(),
             billingCycle: planData.cycle,
             trialEndsAt: expiresAt,
           },
@@ -134,14 +134,14 @@ export const BillingService = {
         const amount = toDecimal(order.amount);
         if (balance.lt(amount)) throw new Error("Insufficient wallet balance");
         const newBalance = balance.minus(amount);
-        await tx.wallet.update({ where: { id: wallet.id }, data: { balance: newBalance, totalSpent: toDecimal(wallet.totalSpent).plus(amount) } });
+        await tx.wallet.update({ where: { id: wallet.id }, data: { balance: newBalance.toNumber(), totalSpent: toDecimal(wallet.totalSpent).plus(amount).toNumber() } });
         await tx.walletTransaction.create({
           data: {
             walletId: wallet.id,
             userId: order.userId,
             type: "PAYMENT",
-            amount: amount.negated(),
-            balanceAfter: newBalance,
+            amount: amount.negated().toNumber(),
+            balanceAfter: newBalance.toNumber(),
             description: `Subscription payment — ${order.plan}`,
             relatedOrderId: order.id,
             status: "COMPLETED",
@@ -262,10 +262,10 @@ export const BillingService = {
       const newBalance = toDecimal(wallet.balance).plus(amt);
       await tx.wallet.update({
         where: { id: wallet.id },
-        data: { balance: newBalance, totalDeposited: toDecimal(wallet.totalDeposited).plus(amt) },
+        data: { balance: newBalance.toNumber(), totalDeposited: toDecimal(wallet.totalDeposited).plus(amt).toNumber() },
       });
       const txn = await tx.walletTransaction.create({
-        data: { walletId: wallet.id, userId, type: "DEPOSIT", amount: amt, balanceAfter: newBalance, method, reference, description: "Wallet deposit", status: "COMPLETED", createdBy: user?.id },
+        data: { walletId: wallet.id, userId, type: "DEPOSIT", amount: amt.toNumber(), balanceAfter: newBalance.toNumber(), method, reference, description: "Wallet deposit", status: "COMPLETED", createdBy: user?.id },
       });
       await AuditService.log({ userId: user?.id, action: "WALLET_DEPOSIT", entity: "WalletTransaction", entityId: txn.id, changes: { amount: amt.toFixed(2), method } }, tx);
       return { ...txn, amount: txn.amount.toFixed(2), balanceAfter: txn.balanceAfter.toFixed(2) };
@@ -289,10 +289,10 @@ export const BillingService = {
       const newBalance = toDecimal(wallet.balance).minus(amt);
       await tx.wallet.update({
         where: { id: wallet.id },
-        data: { balance: newBalance, totalWithdrawn: toDecimal(wallet.totalWithdrawn).plus(amt) },
+        data: { balance: newBalance.toNumber(), totalWithdrawn: toDecimal(wallet.totalWithdrawn).plus(amt).toNumber() },
       });
       const txn = await tx.walletTransaction.create({
-        data: { walletId: wallet.id, userId, type: "WITHDRAW", amount: amt.negated(), balanceAfter: newBalance, method, reference, description: "Wallet withdrawal", status: "COMPLETED", createdBy: user?.id },
+        data: { walletId: wallet.id, userId, type: "WITHDRAW", amount: amt.negated().toNumber(), balanceAfter: newBalance.toNumber(), method, reference, description: "Wallet withdrawal", status: "COMPLETED", createdBy: user?.id },
       });
       await AuditService.log({ userId: user?.id, action: "WALLET_WITHDRAW", entity: "WalletTransaction", entityId: txn.id, changes: { amount: amt.toFixed(2), method } }, tx);
       return { ...txn, amount: txn.amount.toFixed(2), balanceAfter: txn.balanceAfter.toFixed(2) };
@@ -326,7 +326,7 @@ export const BillingService = {
       const payout = await tx.payoutRequest.create({
         data: {
           payoutNumber,
-          amount: toDecimal(data.amount),
+          amount: toDecimal(data.amount).toNumber(),
           type: data.type,
           payoutAccountId: data.payoutAccountId ?? null,
           recipientName: data.recipientName,

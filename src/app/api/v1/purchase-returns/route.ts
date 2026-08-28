@@ -69,7 +69,7 @@ export async function POST(request: NextRequest) {
         return { productId: it.productId, quantity: qty, unitCost, total: lineTotal };
       });
       const ret = await tx.purchaseReturn.create({
-        data: { returnNumber, purchaseId: purchase.id, status: "COMPLETED", total, reason: parsed.data.reason, createdBy: user?.id, items: { create: lineItems } },
+        data: { returnNumber, purchaseId: purchase.id, status: "COMPLETED", total: total.toNumber(), reason: parsed.data.reason, createdBy: user?.id, items: { create: lineItems.map((li) => ({ productId: li.productId, quantity: li.quantity.toNumber(), unitCost: li.unitCost, total: li.total.toNumber() })) } },
         include: { items: true },
       });
       // Return stock to supplier = reduce inventory (TRANSFER_OUT for
@@ -95,7 +95,7 @@ export async function POST(request: NextRequest) {
       const clampedDue = newDue.lt(0) ? new Prisma.Decimal(0) : newDue;
       await tx.purchase.update({
         where: { id: purchase.id },
-        data: { dueAmount: clampedDue },
+        data: { dueAmount: clampedDue.toNumber() },
       });
       await AuditService.log(
         {
