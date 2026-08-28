@@ -8,7 +8,7 @@ import { KanbanBoard, ViewToggle, type KanbanColumn } from "../kanban";
 import { toast } from "sonner";
 import { formatDate } from "@/lib/date-range";
 
-type Delivery = { id: string; status: string; trackingNumber?: string | null; deliveryCharge: string; codAmount: string; courierName?: string | null; recipientName?: string | null; recipientPhone?: string | null; order: { id: string; orderNumber: string; total: string; customer: { id: string; name: string; phone: string } }; courierProvider?: { id: string; name: string } | null };
+type Delivery = { id: string; status: string; trackingNumber?: string | null; deliveryCharge: string; codAmount: string; actualCourierCost?: string | number; courierName?: string | null; recipientName?: string | null; recipientPhone?: string | null; order: { id: string; orderNumber: string; total: string; customer: { id: string; name: string; phone: string } }; courierProvider?: { id: string; name: string } | null; createdAt: string };
 
 export function DeliveriesView() {
   const { navigate } = useCrmStore();
@@ -88,10 +88,15 @@ export function DeliveriesView() {
             { key: "order", header: "Order", render: (r) => <div><div className="font-medium">{r.order.orderNumber}</div><div className="text-xs text-muted-foreground">{r.order.customer?.name}</div></div> },
             { key: "courier", header: "Courier", render: (r) => r.courierProvider?.name ?? r.courierName ?? "—" },
             { key: "tracking", header: "Tracking", render: (r) => r.trackingNumber ? <span className="text-xs font-mono">{r.trackingNumber}</span> : "—" },
-            { key: "charge", header: "Charge", render: (r) => money(r.deliveryCharge) },
-            { key: "cod", header: "COD", render: (r) => money(r.codAmount) },
+            { key: "charge", header: "Charge", render: (r) => <span className="tabular-nums">{money(r.deliveryCharge)}</span> },
+            { key: "cost", header: "Cost", render: (r) => <span className="tabular-nums text-muted-foreground">{money(String(r.actualCourierCost ?? 0))}</span> },
+            { key: "profit", header: "Profit", render: (r) => {
+              const profit = num(r.deliveryCharge) - num(String(r.actualCourierCost ?? 0));
+              return <span className={`font-medium tabular-nums ${profit >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-red-600 dark:text-red-400"}`}>{money(profit.toFixed(2))}</span>;
+            } },
+            { key: "cod", header: "COD", render: (r) => <span className="tabular-nums text-muted-foreground">{money(r.codAmount)}</span> },
             { key: "status", header: "Status", render: (r) => <StatusBadge status={r.status} /> },
-            { key: "date", header: "Date", render: (r) => <span className="text-xs text-muted-foreground">{formatDate((r as any).createdAt ?? new Date())}</span> },
+            { key: "date", header: "Date", render: (r) => <span className="text-xs text-muted-foreground whitespace-nowrap">{formatDate(r.createdAt ?? new Date())}</span> },
           ]}
         />
       ) : (

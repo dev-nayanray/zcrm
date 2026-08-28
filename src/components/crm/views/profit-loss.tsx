@@ -83,7 +83,12 @@ export function ProfitLossView() {
               <Row label="COGS (historical snapshots)" value={`- ${money(data?.cogs)}`} muted />
               <div className={`flex justify-between font-bold border-t pt-1 ${gp >= 0 ? "text-emerald-600" : "text-red-600"}`}><span>Gross Profit</span><span>{money(data?.grossProfit)}</span></div>
               <Row label="Operating Expenses" value={`- ${money(data?.operatingExpenses)}`} muted />
+              <Row label="Refunds" value={`- ${money(data?.refunds)}`} muted />
               <div className={`flex justify-between font-bold border-t pt-1 text-lg ${np >= 0 ? "text-emerald-600" : "text-red-600"}`}><span>Net Profit</span><span>{money(data?.netProfit)}</span></div>
+              <div className="flex justify-between text-xs text-muted-foreground pt-1">
+                <span>Profit Margin</span>
+                <span className="font-medium">{num(data?.revenue) > 0 ? `${(np / num(data?.revenue) * 100).toFixed(1)}%` : "—"}</span>
+              </div>
             </CardContent>
           </Card>
           <Card className="lg:col-span-2">

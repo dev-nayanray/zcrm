@@ -272,6 +272,10 @@ export function OrderDetailView() {
               <Row label="Shipping Cost" value={`- ${money(order.shippingCost)}`} />
               <Row label="Other Cost" value={`- ${money(order.otherCost)}`} />
               <div className={`flex justify-between font-bold border-t pt-1 ${num(order.profit) >= 0 ? "text-emerald-600" : "text-red-600"}`}><span>Profit</span><span>{money(order.profit)}</span></div>
+              <div className="flex justify-between text-xs text-muted-foreground pt-0.5">
+                <span>Profit Margin</span>
+                <span className="font-medium">{num(order.total) > 0 ? `${(num(order.profit) / num(order.total) * 100).toFixed(1)}%` : "—"}</span>
+              </div>
             </CardContent>
           </Card>
 
