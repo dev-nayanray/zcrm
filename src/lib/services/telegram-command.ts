@@ -11,6 +11,18 @@ import { NotificationService } from "./notification";
 import { Permission } from "@/lib/constants";
 import { toDecimal } from "@/lib/decimal";
 import { money, num } from "@/lib/api-client";
+import { hashPassword } from "@/lib/auth";
+import { AuditService } from "./audit";
+
+const MANAGEABLE_ROLES = ["SUPER_ADMIN", "ADMIN", "MANAGER", "SALES", "INVENTORY", "ACCOUNTANT"] as const;
+
+function generateTempPassword(): string {
+  // 12-char alphanumeric, cryptographically random — shown once to the
+  // admin who requested it, never logged or stored in plaintext.
+  const alphabet = "ABCDEFGHJKMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789";
+  const bytes = crypto.getRandomValues(new Uint8Array(12));
+  return Array.from(bytes, (b) => alphabet[b % alphabet.length]).join("");
+}
 
 // TelegramCommandService — dispatches Telegram commands and callback queries.
 // Reuses ALL existing CRM services (no duplicate business logic).
@@ -116,7 +128,23 @@ export const TelegramCommandService = {
       "/expenses": this.cmdExpenses, "/products": this.cmdProducts, "/stockcount": this.cmdStockCount,
       "/movements": this.cmdStockMovements, "/warehouses": this.cmdWarehouses, "/transfers": this.cmdTransfers,
       "/inbox": this.cmdInbox, "/notifications": this.cmdNotifications, "/pipeline": this.cmdPipeline,
+      "/users": this.cmdUsers,
     };
+
+    // /adduser needs the raw "|"-separated text after the command, not the
+    // space-split args array every other command uses — handle it here.
+    if (command === "/adduser") {
+      try {
+        const raw = text.slice(command.length).trim();
+        await this.cmdAddUser(ctx, raw, lang);
+        await TelegramService.logAction({ groupId: ctx.group.id, userId: ctx.user?.id, telegramUserId: fromId, action: "COMMAND", command, result: "ok" });
+        return { ok: true, action: "adduser" };
+      } catch (e) {
+        await TelegramService.sendMessage(chatId, `❌ ${(e as Error).message}`);
+        return { ok: false, action: "adduser" };
+      }
+    }
+
     const handler = handlerMap[command];
     if (handler) {
       try {
@@ -331,6 +359,15 @@ export const TelegramCommandService = {
       case "stockcount_approve": return this.approveStockCount(ctx, params[0], messageId, lang);
       case "stockcount_approve_confirm": return this.confirmApproveStockCount(ctx, params[0], messageId, lang);
       case "due_page": return this.paginateDue(ctx, Number(params[0]) || 1, messageId, lang);
+      case "users_page": return this.paginateUsers(ctx, Number(params[0]) || 1, messageId, lang);
+      case "user_view": return this.viewUser(ctx, params[0], messageId, lang);
+      case "user_role_menu": return this.userRoleMenu(ctx, params[0], messageId, lang);
+      case "user_role_set": return this.confirmUserRolePrompt(ctx, params[0], params[1], messageId, lang);
+      case "user_role_set_confirm": return this.confirmUserRole(ctx, params[0], params[1], messageId, lang);
+      case "user_toggle": return this.confirmUserTogglePrompt(ctx, params[0], messageId, lang);
+      case "user_toggle_confirm": return this.confirmUserToggle(ctx, params[0], params[1], messageId, lang);
+      case "user_resetpw": return this.confirmUserResetPwPrompt(ctx, params[0], messageId, lang);
+      case "user_resetpw_confirm": return this.confirmUserResetPw(ctx, params[0], messageId, lang);
       case "menu": return this.sendMenu(ctx, lang, messageId);
       case "help": return this.sendHelp(ctx, lang);
       default:
@@ -398,6 +435,7 @@ export const TelegramCommandService = {
     if (can("leads:read")) rows.push([btn("🎯 Leads", "leads_page:1")]);
     if (can("stock_counts:read")) rows.push([btn("📋 Stock Count", "stockcount_page:1")]);
     if (can("reports:read")) rows.push([btn("📈 Reports", "menu")]);
+    if (can("users:read")) rows.push([btn("🧑‍💼 Users", "users_page:1")]);
     rows.push([btn("❓ Help", "help")]);
     return { inline_keyboard: rows };
   },
@@ -409,6 +447,8 @@ export const TelegramCommandService = {
     const cmds: string[] = ["/start", "/help"];
     if (can("orders:read")) cmds.push("/orders — recent orders");
     if (can("customers:read")) cmds.push("/customers — customer list");
+    if (can("users:read")) cmds.push("/users — manage CRM users (role, status, password)");
+    if (can("users:create")) cmds.push("/adduser Name | email | ROLE | phone — create a user");
     if (can("inventory:read")) cmds.push("/inventory — stock levels");
     if (can("payments:read")) cmds.push("/payments — recent payments");
     if (can("leads:read")) cmds.push("/leads — Meta leads");
@@ -542,6 +582,173 @@ export const TelegramCommandService = {
     const text = `<b>${c.name}</b>\n📞 ${c.phone}\n📧 ${c.email ?? "—"}\n🏙️ ${c.city ?? "—"}\n📦 Orders: ${c._count.orders}\n💵 Total: ${money((orderAgg._sum.total ?? 0).toFixed(2))}\n💸 Due: ${money(due.toFixed(2))}`;
     const rows: any[][] = [[{ text: "⬅️ Back", callback_data: "customers_page:1" }]];
     await this.sendOrEdit(ctx, text, { inline_keyboard: rows }, messageId);
+  },
+
+  // --- Users (full CRUD via bot) ---
+  async cmdUsers(ctx: CommandContext, _args: string[], lang: string) {
+    if (!this.can(ctx, "users:read")) return this.deny(ctx, lang);
+    await this.paginateUsers(ctx, 1, undefined, lang);
+  },
+  async paginateUsers(ctx: CommandContext, page: number, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "users:read")) return this.deny(ctx, lang);
+    const [items, total] = await Promise.all([
+      db.user.findMany({ orderBy: { createdAt: "desc" }, skip: (page - 1) * 5, take: 5, include: { role: true } }),
+      db.user.count(),
+    ]);
+    if (!items.length) return TelegramService.sendMessage(ctx.chatId, this.t("noData", lang));
+    const totalPages = Math.ceil(total / 5) || 1;
+    const text = `<b>🧑‍💼 Users</b> (${total})\n\n` + items.map((u) => `• ${u.name} · ${u.role.name}${u.isActive ? "" : " (inactive)"}`).join("\n") + `\n\n${this.t("page", lang).replace("{p}", String(page)).replace("{t}", String(totalPages))}`;
+    const rows: any[][] = items.map((u) => [{ text: `${u.isActive ? "🟢" : "⚪"} ${u.name} (${u.role.name})`, callback_data: `user_view:${u.id}` }]);
+    rows.push(this.paginationRow(page, totalPages, "users_page"));
+    await this.sendOrEdit(ctx, text, { inline_keyboard: rows }, messageId);
+  },
+
+  async viewUser(ctx: CommandContext, userId: string, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "users:read")) return this.deny(ctx, lang);
+    const u = await db.user.findUnique({ where: { id: userId }, include: { role: true } });
+    if (!u) return TelegramService.sendMessage(ctx.chatId, "User not found");
+    const text = `<b>${u.name}</b>\n📧 ${u.email}\n📞 ${u.phone ?? "—"}\n🎭 Role: <b>${u.role.name}</b>\n${u.isActive ? "🟢 Active" : "⚪ Inactive"}\n🕐 Last login: ${u.lastLoginAt ? new Date(u.lastLoginAt).toLocaleString() : "never"}`;
+    const rows: any[][] = [];
+    const isSelf = ctx.user?.id === u.id;
+    if (this.can(ctx, "users:update") && !isSelf) {
+      rows.push([{ text: "🎭 Change Role", callback_data: `user_role_menu:${u.id}` }]);
+      rows.push([{ text: u.isActive ? "⛔ Deactivate" : "✅ Activate", callback_data: `user_toggle:${u.id}` }]);
+      rows.push([{ text: "🔑 Reset Password", callback_data: `user_resetpw:${u.id}` }]);
+    } else if (isSelf) {
+      rows.push([{ text: "ℹ️ Manage your own account in the CRM dashboard", callback_data: "user_view:" + u.id }]);
+    }
+    rows.push([{ text: "⬅️ Back", callback_data: "users_page:1" }]);
+    await this.sendOrEdit(ctx, text, { inline_keyboard: rows }, messageId);
+  },
+
+  async userRoleMenu(ctx: CommandContext, userId: string, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "users:update")) return this.deny(ctx, lang);
+    const u = await db.user.findUnique({ where: { id: userId }, include: { role: true } });
+    if (!u) return TelegramService.sendMessage(ctx.chatId, "User not found");
+    const assignable = MANAGEABLE_ROLES.filter((r) => r !== u.role.name && (r !== "SUPER_ADMIN" || ctx.roleName === "SUPER_ADMIN"));
+    const rows: any[][] = assignable.map((r) => [{ text: r, callback_data: `user_role_set:${u.id}|${r}` }]);
+    rows.push([{ text: "⬅️ Back", callback_data: `user_view:${u.id}` }]);
+    await this.sendOrEdit(ctx, `Select new role for <b>${u.name}</b> (current: ${u.role.name}):`, { inline_keyboard: rows }, messageId);
+  },
+
+  async confirmUserRolePrompt(ctx: CommandContext, userId: string, roleName: string, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "users:update")) return this.deny(ctx, lang);
+    const kb = { inline_keyboard: [[
+      { text: this.t("yes", lang), callback_data: `user_role_set_confirm:${userId}|${roleName}` },
+      { text: this.t("no", lang), callback_data: `user_view:${userId}` },
+    ]] };
+    await this.sendOrEdit(ctx, `${this.t("confirm", lang)} Set role to <b>${roleName}</b>?`, kb, messageId);
+  },
+
+  async confirmUserRole(ctx: CommandContext, userId: string, roleName: string, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "users:update")) return this.deny(ctx, lang);
+    try {
+      const existing = await db.user.findUnique({ where: { id: userId }, include: { role: true } });
+      if (!existing) throw new Error("User not found");
+      if (roleName === "SUPER_ADMIN" && ctx.roleName !== "SUPER_ADMIN") throw new Error("Only a SUPER_ADMIN can assign the SUPER_ADMIN role");
+      if (existing.role.name === "SUPER_ADMIN" && roleName !== "SUPER_ADMIN") {
+        const count = await db.user.count({ where: { role: { name: "SUPER_ADMIN" }, isActive: true } });
+        if (count <= 1) throw new Error("Cannot demote the last SUPER_ADMIN. Promote another user first.");
+      }
+      const role = await db.role.findUnique({ where: { name: roleName } });
+      if (!role) throw new Error("Invalid role");
+      const updated = await db.user.update({ where: { id: userId }, data: { roleId: role.id }, include: { role: true } });
+      await AuditService.log({ userId: ctx.user?.id ?? null, action: "USER_UPDATE", entity: "User", entityId: userId, changes: { roleName, via: "telegram" } });
+      await this.sendOrEdit(ctx, `${this.t("done", lang)} <b>${updated.name}</b> is now <b>${updated.role.name}</b>.`, { inline_keyboard: [[{ text: "⬅️ Back to user", callback_data: `user_view:${userId}` }]] }, messageId);
+    } catch (e) {
+      await TelegramService.sendMessage(ctx.chatId, `❌ ${(e as Error).message}`);
+    }
+  },
+
+  async confirmUserTogglePrompt(ctx: CommandContext, userId: string, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "users:update")) return this.deny(ctx, lang);
+    const u = await db.user.findUnique({ where: { id: userId } });
+    if (!u) return TelegramService.sendMessage(ctx.chatId, "User not found");
+    const nextState = u.isActive ? "inactive" : "active";
+    const kb = { inline_keyboard: [[
+      { text: this.t("yes", lang), callback_data: `user_toggle_confirm:${userId}|${nextState}` },
+      { text: this.t("no", lang), callback_data: `user_view:${userId}` },
+    ]] };
+    await this.sendOrEdit(ctx, `${this.t("confirm", lang)} ${u.isActive ? "Deactivate" : "Activate"} <b>${u.name}</b>?`, kb, messageId);
+  },
+
+  async confirmUserToggle(ctx: CommandContext, userId: string, nextState: string, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "users:update")) return this.deny(ctx, lang);
+    try {
+      if (ctx.user?.id === userId) throw new Error("You cannot deactivate your own account");
+      const existing = await db.user.findUnique({ where: { id: userId }, include: { role: true } });
+      if (!existing) throw new Error("User not found");
+      const isActive = nextState === "active";
+      if (!isActive && existing.role.name === "SUPER_ADMIN") {
+        const count = await db.user.count({ where: { role: { name: "SUPER_ADMIN" }, isActive: true } });
+        if (count <= 1) throw new Error("Cannot deactivate the last SUPER_ADMIN. Promote another user first.");
+      }
+      const updated = await db.user.update({ where: { id: userId }, data: { isActive } });
+      await AuditService.log({ userId: ctx.user?.id ?? null, action: "USER_UPDATE", entity: "User", entityId: userId, changes: { isActive, via: "telegram" } });
+      await this.sendOrEdit(ctx, `${this.t("done", lang)} <b>${updated.name}</b> is now ${isActive ? "🟢 active" : "⚪ inactive"}.`, { inline_keyboard: [[{ text: "⬅️ Back to user", callback_data: `user_view:${userId}` }]] }, messageId);
+    } catch (e) {
+      await TelegramService.sendMessage(ctx.chatId, `❌ ${(e as Error).message}`);
+    }
+  },
+
+  async confirmUserResetPwPrompt(ctx: CommandContext, userId: string, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "users:update")) return this.deny(ctx, lang);
+    const u = await db.user.findUnique({ where: { id: userId } });
+    if (!u) return TelegramService.sendMessage(ctx.chatId, "User not found");
+    const kb = { inline_keyboard: [[
+      { text: this.t("yes", lang), callback_data: `user_resetpw_confirm:${userId}` },
+      { text: this.t("no", lang), callback_data: `user_view:${userId}` },
+    ]] };
+    await this.sendOrEdit(ctx, `${this.t("confirm", lang)} Reset password for <b>${u.name}</b>? A new temporary password will be generated.`, kb, messageId);
+  },
+
+  async confirmUserResetPw(ctx: CommandContext, userId: string, messageId: number | undefined, lang: string) {
+    if (!this.can(ctx, "users:update")) return this.deny(ctx, lang);
+    try {
+      const u = await db.user.findUnique({ where: { id: userId } });
+      if (!u) throw new Error("User not found");
+      const tempPassword = generateTempPassword();
+      const passwordHash = await hashPassword(tempPassword);
+      // Bump tokenVersion to revoke any existing sessions for this user,
+      // consistent with the CRM's normal password-reset behavior.
+      await db.user.update({ where: { id: userId }, data: { passwordHash, tokenVersion: { increment: 1 } } });
+      await AuditService.log({ userId: ctx.user?.id ?? null, action: "USER_UPDATE", entity: "User", entityId: userId, changes: { password: "[REDACTED]", via: "telegram" } });
+      // Password is shown ONCE here, to the admin who requested it, and
+      // never written to the audit log or logged anywhere else.
+      await this.sendOrEdit(ctx, `${this.t("done", lang)} New password for <b>${u.name}</b>:\n\n<code>${tempPassword}</code>\n\n⚠️ Share this securely and ask them to change it after logging in.`, { inline_keyboard: [[{ text: "⬅️ Back to user", callback_data: `user_view:${userId}` }]] }, messageId);
+    } catch (e) {
+      await TelegramService.sendMessage(ctx.chatId, `❌ ${(e as Error).message}`);
+    }
+  },
+
+  // /adduser Name | email | ROLE | phone(optional)
+  async cmdAddUser(ctx: CommandContext, raw: string, lang: string) {
+    if (!this.can(ctx, "users:create")) return this.deny(ctx, lang);
+    const usage = "Usage:\n<code>/adduser Full Name | email@example.com | ROLE | phone(optional)</code>\n\nRoles: " + MANAGEABLE_ROLES.join(", ");
+    if (!raw) return TelegramService.sendMessage(ctx.chatId, usage);
+    const parts = raw.split("|").map((p) => p.trim());
+    if (parts.length < 3) return TelegramService.sendMessage(ctx.chatId, usage);
+    const [name, email, roleRaw, phone] = parts;
+    const roleName = roleRaw?.toUpperCase();
+    if (!name || name.length < 2) return TelegramService.sendMessage(ctx.chatId, "❌ Name must be at least 2 characters.");
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return TelegramService.sendMessage(ctx.chatId, "❌ Invalid email address.");
+    if (!MANAGEABLE_ROLES.includes(roleName as any)) return TelegramService.sendMessage(ctx.chatId, `❌ Invalid role. Choose one of: ${MANAGEABLE_ROLES.join(", ")}`);
+    if (roleName === "SUPER_ADMIN" && ctx.roleName !== "SUPER_ADMIN") return TelegramService.sendMessage(ctx.chatId, "⛔ Only a SUPER_ADMIN can create SUPER_ADMIN users.");
+    const existing = await db.user.findUnique({ where: { email: email.toLowerCase() } });
+    if (existing) return TelegramService.sendMessage(ctx.chatId, "❌ Email already in use.");
+    const role = await db.role.findUnique({ where: { name: roleName } });
+    if (!role) return TelegramService.sendMessage(ctx.chatId, "❌ Invalid role.");
+    const tempPassword = generateTempPassword();
+    const passwordHash = await hashPassword(tempPassword);
+    const created = await db.user.create({
+      data: { name, email: email.toLowerCase(), phone: phone || undefined, passwordHash, roleId: role.id, isActive: true },
+      include: { role: true },
+    });
+    await AuditService.log({ userId: ctx.user?.id ?? null, action: "USER_CREATE", entity: "User", entityId: created.id, changes: { email: created.email, role: role.name, via: "telegram" } });
+    await TelegramService.sendMessage(
+      ctx.chatId,
+      `✅ User created: <b>${created.name}</b> (${role.name})\n📧 ${created.email}\n\n🔑 Temporary password:\n<code>${tempPassword}</code>\n\n⚠️ Share this securely and ask them to change it after logging in.`,
+    );
   },
 
   async cmdInventory(ctx: CommandContext, _args: string[], lang: string) {
