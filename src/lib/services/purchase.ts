@@ -13,6 +13,7 @@ import { CostingService } from "./costing";
 export const PurchaseService = {
   async create(input: {
     supplierId: string;
+    warehouseId?: string;  // NEW Phase 7: optional warehouse to receive stock into
     discount?: Prisma.Decimal | number | string;
     shippingCost?: Prisma.Decimal | number | string;
     otherCost?: Prisma.Decimal | number | string;
@@ -63,6 +64,7 @@ export const PurchaseService = {
         data: {
           purchaseNumber,
           supplierId: supplier.id,
+          warehouseId: input.warehouseId ?? null,
           status,
           // Schema stores Float — convert Decimals via toNumber().
           subtotal: subtotal.toNumber(),
@@ -97,10 +99,18 @@ export const PurchaseService = {
             referenceId: purchase.id,
             reason: `Purchase ${purchaseNumber}`,
             createdBy,
+            warehouseId: input.warehouseId ?? null,
           });
-          // Recompute WAC AFTER the stock movement has been applied so
-          // CostingService can read the new inventory quantity.
-          await CostingService.recomputeWacInTx(tx, li.productId, li.quantity, li.unitCost);
+          // Recompute WAC AFTER the stock movement has been applied.
+          // Phase 7: if a warehouseId was specified, recompute BOTH the
+          // per-warehouse WAC (WarehouseStock.weightedAverageCost) AND the
+          // product-level WAC (Product.weightedAverageCost). The product-level
+          // WAC is kept as the aggregate cost basis for back-compat.
+          if (input.warehouseId) {
+            await CostingService.recomputeWarehouseWacInTx(tx, li.productId, input.warehouseId, li.quantity, li.unitCost);
+          } else {
+            await CostingService.recomputeWacInTx(tx, li.productId, li.quantity, li.unitCost);
+          }
         }
         await AuditService.log({
           userId: createdBy,

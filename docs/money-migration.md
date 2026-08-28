@@ -1,6 +1,6 @@
 # Money Migration — Float → Integer Minor Units
 
-**Status:** Foundation laid (Phase 4). Migration NOT yet switched.
+**Status:** Release 1 (foundation) + Release 2 (add columns + dual-write + backfill) DONE in Phase 7. Reads still use Float columns — switch is Release 4.
 **Last updated:** 2026-08-28
 
 ## Problem
@@ -134,12 +134,38 @@ Every monetary field in the schema needs a `*Minor` companion:
 | `SalesPipelineEntry` | value |
 | `CustomerCredit` | advanceAmount, creditLimit |
 
-## Current Status (Phase 4)
+## Current Status (Phase 7)
 
-- ✅ `src/lib/money.ts` exists with all conversion utilities
-- ✅ 40 unit tests pass
-- ❌ No `*Minor` columns added to schema yet
-- ❌ No backfill script created yet
-- ❌ Services still write to Float columns (via `.toNumber()`)
+### Release 1 — Foundation (DONE in Phase 4)
+- ✅ `src/lib/money.ts` exists with all conversion utilities (toMinor, fromMinor, backfillMinor, etc.)
+- ✅ 40 unit tests verify round-trip conversion is lossless
+
+### Release 2 — Add Columns + Dual-Write + Backfill (DONE in Phase 7)
+- ✅ `Order` model now has `*Minor Int?` columns: `totalMinor`, `paidAmountMinor`, `cogsTotalMinor`, `grossProfitMinor`, `netProfitMinor`
+- ✅ `OrderService.create` dual-writes `totalMinor` and `paidAmountMinor` alongside the Float columns
+- ✅ `ProfitabilityService.persistSnapshot` dual-writes `cogsTotalMinor`, `grossProfitMinor`, `netProfitMinor`
+- ✅ Backfill script: `scripts/backfill-money.ts` (supports `--dry-run`)
+- ✅ All new columns are nullable (existing rows have `null` until backfilled)
+
+### Release 3 — Validate (NEXT, not yet done)
+- ❌ Run backfill script against production
+- ❌ Run a verification script that samples N orders and confirms `fromMinor(order.totalMinor).toFixed(2) === order.total.toFixed(2)`
+- ❌ Monitor for any dual-write discrepancies over 1-2 weeks of production traffic
+
+### Release 4 — Switch Reads (NOT YET DONE)
+- ❌ Update services to read from `*Minor` columns instead of Float
+- ❌ Update API responses to return minor-unit integers
+- ❌ Update Telegram display to convert minor → major at the presentation layer
+
+### Release 5 — Remove Float Columns (NOT YET DONE)
+- ❌ Drop the Float columns (after verification period)
+
+## Rollback
+
+At any point before Release 5:
+- **Release 2 rollback:** Drop the `*Minor` columns. No data loss — Float columns are still the source of truth.
+- **Release 4 rollback:** Revert reads to use Float columns. The `*Minor` columns are still populated (dual-write), so no data loss.
+
+After Release 5 (Float columns removed), rollback requires a re-migration script to convert Int back to Float — but this is lossy. **Don't revert after Release 5.**
 
 **The migration is architecturally ready but not switched on.** Switching requires the multi-release process above.

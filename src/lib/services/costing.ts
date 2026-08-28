@@ -134,6 +134,108 @@ export const CostingService = {
     return newWac;
   },
 
+  // ─────────────────────────────────────────────────────────────────────
+  // PER-WAREHOUSE WAC (Phase 7)
+  //
+  // Recompute the Weighted Average Cost for a product WITHIN a specific
+  // warehouse. Called after a purchase is received into a warehouse (the
+  // PURCHASE stock movement has already been applied by the caller).
+  //
+  // Formula:
+  //   newWAC = (existingQty * existingWAC + receivedQty * newUnitCost)
+  //            / (existingQty + receivedQty)
+  //
+  // The product-level WAC (recomputeWacInTx above) is ALSO recomputed —
+  // it serves as the aggregate cost basis used by OrderService when the
+  // order doesn't specify a warehouse (back-compat with Phase 2–6 orders).
+  //
+  // FALLBACK: if no WarehouseStock row exists for (warehouse, product),
+  // we create one with the received quantity and set its WAC = newUnitCost.
+  // If the warehouse is not specified (null), only the product-level WAC
+  // is updated — warehouse WAC is skipped.
+  // ─────────────────────────────────────────────────────────────────────
+  async recomputeWarehouseWacInTx(
+    tx: TxClient,
+    productId: string,
+    warehouseId: string | null | undefined,
+    newQty: Prisma.Decimal | number,
+    newUnitCost: Prisma.Decimal | number,
+  ): Promise<{ warehouseWac: Prisma.Decimal | null; productWac: Prisma.Decimal }> {
+    const qty = toDecimal(newQty);
+    const unitCost = toDecimal(newUnitCost);
+    if (qty.lte(0)) throw new Error("WAC recompute requires positive quantity");
+
+    // Always recompute the product-level WAC (back-compat + aggregate view).
+    const productWac = await this.recomputeWacInTx(tx, productId, qty, unitCost);
+
+    // If no warehouse specified, skip the per-warehouse WAC.
+    if (!warehouseId) return { warehouseWac: null, productWac };
+
+    // Find or create the WarehouseStock row for this (warehouse, product).
+    let ws = await tx.warehouseStock.findUnique({
+      where: { warehouseId_productId: { warehouseId, productId } },
+    });
+    if (!ws) {
+      // Create with the received quantity + the new unit cost as WAC.
+      // (First purchase into this warehouse → WAC = unit cost.)
+      ws = await tx.warehouseStock.create({
+        data: {
+          warehouseId,
+          productId,
+          quantity: qty.toNumber(),
+          reservedQuantity: 0,
+          damagedQuantity: 0,
+          weightedAverageCost: unitCost.toNumber(),
+        },
+      });
+      return { warehouseWac: unitCost, productWac };
+    }
+
+    // WarehouseStock row exists — compute the new WAC.
+    // IMPORTANT: the PURCHASE stock movement has already incremented
+    // ws.quantity by `qty`. So `ws.quantity` now includes the received
+    // units. We need the PRE-purchase quantity = ws.quantity - qty.
+    const liveQuantity = toDecimal(ws.quantity);
+    const reserved = toDecimal(ws.reservedQuantity);
+    const damaged = toDecimal(ws.damagedQuantity);
+    const prePurchaseSellable = liveQuantity.minus(qty).minus(reserved).minus(damaged);
+
+    const currentWac = toDecimal(ws.weightedAverageCost);
+    const totalQty = prePurchaseSellable.plus(qty);
+    let newWac: Prisma.Decimal;
+    if (totalQty.lte(0)) {
+      newWac = unitCost; // defensive
+    } else {
+      const existingValue = prePurchaseSellable.times(currentWac);
+      const newValue = qty.times(unitCost);
+      newWac = existingValue.plus(newValue).dividedBy(totalQty);
+    }
+
+    await tx.warehouseStock.update({
+      where: { id: ws.id },
+      data: { weightedAverageCost: newWac.toNumber() },
+    });
+
+    return { warehouseWac: newWac, productWac };
+  },
+
+  /**
+   * Get the warehouse-specific cost basis for a product in a warehouse.
+   * Falls back to the product-level WAC if the warehouse has no WAC yet.
+   * Used for inventory valuation and per-warehouse COGS (future: when
+   * OrderService supports warehouse-specific order items).
+   */
+  async getWarehouseCostBasisInTx(tx: TxClient, productId: string, warehouseId: string): Promise<Prisma.Decimal> {
+    const ws = await tx.warehouseStock.findUnique({
+      where: { warehouseId_productId: { warehouseId, productId } },
+    });
+    if (ws && toDecimal(ws.weightedAverageCost).gt(0)) {
+      return toDecimal(ws.weightedAverageCost);
+    }
+    // Fall back to product-level WAC.
+    return this.getCostBasisInTx(tx, productId);
+  },
+
   /**
    * Get the current COGS basis for a product. Used by OrderService.create
    * when snapshotting OrderItem.unitCost. Prefers WAC; falls back to

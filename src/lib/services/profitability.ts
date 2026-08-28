@@ -159,16 +159,26 @@ export const ProfitabilityService = {
   /**
    * Persist the computed snapshot onto the order row. Called by
    * OrderService.create and any update path that touches financials.
+   *
+   * Phase 7: now dual-writes the integer minor-unit columns (*Minor)
+   * alongside the Float columns, so the money migration can verify
+   * consistency before switching reads in Release 4.
    */
   async persistSnapshot(orderId: string, tx: Prisma.TransactionClient) {
     const snap = await this.computeOrderSnapshot(orderId, tx);
+    // Import toMinor here to avoid a circular import at module load.
+    const { toMinor } = await import("@/lib/money");
     await tx.order.update({
       where: { id: orderId },
       data: {
-        // Schema stores Float — convert Decimals via toNumber().
+        // Float columns (current source of truth)
         cogsTotal: snap.cogsTotal.toNumber(),
         grossProfit: snap.grossProfit.toNumber(),
         netProfit: snap.netProfit.toNumber(),
+        // Integer minor-unit columns (dual-write — Release 2 of money migration)
+        cogsTotalMinor: toMinor(snap.cogsTotal),
+        grossProfitMinor: toMinor(snap.grossProfit),
+        netProfitMinor: toMinor(snap.netProfit),
       },
     });
     return snap;

@@ -3,6 +3,10 @@
     {
       "path": "/api/cron/woocommerce-retry",
       "schedule": "*/5 * * * *"
+    },
+    {
+      "path": "/api/cron/session-cleanup",
+      "schedule": "*/15 * * * *"
     }
   ]
 }

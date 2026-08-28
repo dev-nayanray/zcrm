@@ -232,6 +232,17 @@ model Order {
   cogsTotal     Float  @default(0)  // Σ OrderItem.unitCost × quantity  (historical snapshot)
   grossProfit   Float  @default(0)  // (total − tax) − cogsTotal  [revenue minus direct cost]
   netProfit     Float  @default(0)  // grossProfit − (shippingCost + otherCost + packagingCost + paymentFee + platformFee) − orderExpenses
+  // ── Money migration Release 2 (Phase 7) — integer minor-unit columns ──
+  // These mirror the Float columns above (in poisha: ৳100.50 → 10050).
+  // Nullable initially — backfilled by scripts/backfill-money.ts.
+  // Reads still use the Float columns; these are populated via dual-write
+  // so we can verify consistency before switching reads in Release 4.
+  // See docs/money-migration.md for the full 5-release plan.
+  totalMinor    Int?
+  paidAmountMinor Int?
+  cogsTotalMinor Int?
+  grossProfitMinor Int?
+  netProfitMinor Int?
   externalId    String?  @unique // WooCommerce order id (sparse unique — duplicate-prevention across webhooks, manual entry, and Telegram)
   syncStatus    String   @default("LOCAL") // LOCAL|SYNCED|FAILED
   sourceChannel String?  // legacy label
@@ -380,6 +391,7 @@ model Warehouse {
   transfersTo    StockTransfer[] @relation("TransferTo")
   stockCounts    StockCount[]
   expenses       Expense[]  // warehouse-specific expenses
+  purchases      Purchase[]  // purchases received into this warehouse (Phase 7)
 }
 
 model WarehouseStock {
@@ -391,6 +403,12 @@ model WarehouseStock {
   quantity         Float  @default(0)
   reservedQuantity Float  @default(0)
   damagedQuantity  Float  @default(0)
+  // Per-warehouse Weighted Average Cost (Phase 7).
+  // Recomputed on every purchase receipt for this warehouse:
+  //   newWAC = (existingQty * existingWAC + receivedQty * newUnitCost) / (existingQty + receivedQty)
+  // Falls back to Product.weightedAverageCost for warehouses that have no
+  // purchase history yet (back-compat). See CostingService.recomputeWarehouseWacInTx.
+  weightedAverageCost Float @default(0)
   updatedAt        DateTime @updatedAt
 
   @@unique([warehouseId, productId])
@@ -440,6 +458,11 @@ model Purchase {
   supplierId    String
   supplier      Supplier @relation(fields: [supplierId], references: [id], onDelete: Restrict, onUpdate: NoAction)
   status        String   @default("PENDING") // PENDING|RECEIVED|CANCELLED
+  // Optional: the warehouse this purchase is received into. If null, stock
+  // goes to the default Inventory row. When set, the per-warehouse WAC is
+  // recomputed via CostingService.recomputeWarehouseWacInTx.
+  warehouseId   String?
+  warehouse     Warehouse? @relation(fields: [warehouseId], references: [id], onDelete: SetNull, onUpdate: NoAction)
   subtotal      Float  @default(0)
   discount      Float  @default(0)
   shippingCost  Float  @default(0)

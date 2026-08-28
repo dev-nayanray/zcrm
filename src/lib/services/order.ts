@@ -187,6 +187,7 @@ export const OrderService = {
 
       // Create order
       const reserveStock = input.reserveStock === true;
+      const { toMinor } = await import("@/lib/money");
       const order = await tx.order.create({
         data: {
           orderNumber,
@@ -207,6 +208,9 @@ export const OrderService = {
           platformFee: platformFee.toNumber(),
           total: total.toNumber(),
           paidAmount: 0,
+          // Phase 7: dual-write integer minor-unit columns (money migration Release 2)
+          totalMinor: toMinor(total),
+          paidAmountMinor: 0,
           externalId: input.externalId,
           syncStatus: input.syncStatus ?? "LOCAL",
           sourceChannel: input.sourceChannel,
@@ -284,7 +288,12 @@ export const OrderService = {
         else paymentStatus = "PARTIAL";
         await tx.order.update({
           where: { id: order.id },
-          data: { paidAmount: paidAmount.toNumber(), paymentStatus },
+          data: {
+            paidAmount: paidAmount.toNumber(),
+            paymentStatus,
+            // Phase 7: dual-write minor-unit paid amount
+            paidAmountMinor: toMinor(paidAmount),
+          },
         });
       }
 
