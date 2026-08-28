@@ -3,10 +3,9 @@ import { useEffect, useState } from "react";
 import { useCrmStore } from "@/lib/store";
 import { api } from "@/lib/api-client";
 import { Button } from "@/components/ui/button";
-import { Sheet, SheetContent, SheetTrigger } from "@/components/ui/sheet";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
-import { Bell, LogOut, Menu, Moon, Plus, Search, Sun, User as UserIcon } from "lucide-react";
+import { Bell, LogOut, Menu, Moon, Plus, Search, Sun, User as UserIcon, ShoppingCart, Users, Package, Truck, Receipt, Wallet, ArrowRightLeft, Boxes } from "lucide-react";
 import { toast } from "sonner";
 import { Input } from "@/components/ui/input";
 import { MobileNav } from "./sidebar";
@@ -35,7 +34,6 @@ export function Topbar() {
   async function markAllRead() {
     try {
       await api.patch("/api/v1/notifications");
-      // refresh
       const res = await api.get<{ items: any[] }>("/api/v1/notifications?limit=10");
       setNotifications(res.items);
       setUnread(res.items.filter((n) => !n.isRead).length);
@@ -51,6 +49,20 @@ export function Topbar() {
   }
 
   const initials = (user?.name || "U").split(" ").map((p) => p[0]).slice(0, 2).join("").toUpperCase();
+
+  const quickCreateItems = [
+    { label: "New Order", icon: ShoppingCart, route: "orders/new", perm: "orders:create" },
+    { label: "New Customer", icon: Users, route: "customers", perm: "customers:create" },
+    { label: "New Product", icon: Package, route: "products", perm: "products:create" },
+    { label: "New Purchase", icon: Truck, route: "purchases", perm: "purchases:create" },
+    { label: "New Expense", icon: Receipt, route: "expenses", perm: "expenses:create" },
+    { label: "New Payment", icon: Wallet, route: "payments", perm: "payments:create" },
+    { label: "New Delivery", icon: Truck, route: "deliveries", perm: "deliveries:update" },
+    { label: "Stock Adjustment", icon: ArrowRightLeft, route: "inventory", perm: "inventory:adjust" },
+  ];
+
+  const canSee = (perm: string) => !perm || user?.permissions?.includes(perm) || user?.role === "SUPER_ADMIN" || user?.role === "ADMIN";
+  const visibleQuickItems = quickCreateItems.filter((i) => canSee(i.perm));
 
   return (
     <>
@@ -74,9 +86,30 @@ export function Topbar() {
           <kbd className="hidden lg:inline-flex absolute right-3 top-1/2 -translate-y-1/2 items-center gap-0.5 rounded border border-border/60 bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground pointer-events-none">⏎</kbd>
         </div>
         <div className="flex-1 sm:hidden" />
-        <Button size="sm" className="hidden sm:inline-flex shadow-soft" onClick={() => navigate("orders/new")}>
-          <Plus className="h-4 w-4 mr-1" /> New Order
-        </Button>
+
+        {/* Quick Create dropdown */}
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button size="sm" className="shadow-soft gap-1.5">
+              <Plus className="h-4 w-4" />
+              <span className="hidden sm:inline">Create</span>
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="w-56 shadow-pop">
+            <DropdownMenuLabel className="text-xs text-muted-foreground font-normal">Quick Create</DropdownMenuLabel>
+            <DropdownMenuSeparator />
+            {visibleQuickItems.map((item) => {
+              const Icon = item.icon;
+              return (
+                <DropdownMenuItem key={item.label} onClick={() => navigate(item.route as any)} className="gap-2.5 cursor-pointer py-2">
+                  <Icon className="h-4 w-4 text-muted-foreground" />
+                  <span>{item.label}</span>
+                </DropdownMenuItem>
+              );
+            })}
+          </DropdownMenuContent>
+        </DropdownMenu>
+
         <Button variant="ghost" size="icon" onClick={toggleTheme} aria-label="Toggle theme" className="hover:bg-accent">
           {theme === "light" ? <Moon className="h-[18px] w-[18px]" /> : <Sun className="h-[18px] w-[18px]" />}
         </Button>
@@ -149,6 +182,3 @@ export function Topbar() {
     </>
   );
 }
-
-// silence unused
-void Sheet; void SheetContent; void SheetTrigger;

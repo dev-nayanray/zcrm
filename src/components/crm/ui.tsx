@@ -113,9 +113,10 @@ export function DataTable<T extends { id: string }>({
 // Status tone → maps a status string to a semantic tone
 type Tone = "emerald" | "amber" | "red" | "blue" | "cyan" | "orange" | "fuchsia" | "muted" | "violet";
 const STATUS_TONE: Record<string, Tone> = {
-  PENDING: "amber", CONFIRMED: "blue", PROCESSING: "cyan", SHIPPED: "violet", DELIVERED: "emerald",
+  PENDING: "amber", CONFIRMED: "blue", PROCESSING: "cyan", READY_TO_SHIP: "violet", SHIPPED: "violet", DELIVERED: "emerald",
   CANCELLED: "red", RETURNED: "orange", REFUNDED: "fuchsia", UNPAID: "red", PARTIAL: "amber",
   PAID: "emerald", RECEIVED: "emerald", ACTIVE: "emerald", INACTIVE: "muted", COMPLETED: "emerald",
+  RETURN_REQUESTED: "orange",
   HEALTHY: "emerald", LOW_STOCK: "amber", OUT_OF_STOCK: "red", SUCCESS: "emerald", FAILED: "red",
   CONNECTED: "emerald", DISCONNECTED: "muted", ERROR: "red", SYNCED: "emerald", LOCAL: "muted",
   OPEN: "blue", RESOLVED: "emerald", CLOSED: "muted", NEW: "blue", CONTACTED: "cyan", QUALIFIED: "violet",

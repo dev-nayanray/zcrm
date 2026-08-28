@@ -21,7 +21,7 @@ type Order = {
   itemCount: number; createdAt: string; externalId?: string;
 };
 
-const ORDER_STATUSES = ["PENDING", "CONFIRMED", "PROCESSING", "SHIPPED", "DELIVERED", "CANCELLED"];
+const ORDER_STATUSES = ["PENDING", "CONFIRMED", "PROCESSING", "READY_TO_SHIP", "SHIPPED", "DELIVERED", "COMPLETED", "CANCELLED"];
 
 export function OrdersView() {
   const { navigate, params } = useCrmStore();
@@ -159,12 +159,16 @@ export function OrdersView() {
           columns={[
             { key: "orderNumber", header: "Order #", render: (r) => <div className="font-medium">{r.orderNumber}</div> },
             { key: "customer", header: "Customer", render: (r) => <div><div className="font-medium">{r.customer?.name}</div><div className="text-xs text-muted-foreground">{r.customer?.phone}</div></div> },
-            { key: "channel", header: "Channel", render: (r) => <span className="text-xs">{r.channel?.name}</span> },
-            { key: "total", header: "Total", render: (r) => <div className="font-medium">{money(r.total)}</div> },
-            { key: "paid", header: "Paid", render: (r) => <div className="text-xs text-muted-foreground">{money(r.paidAmount)}</div> },
+            { key: "channel", header: "Channel", render: (r) => <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium bg-muted text-muted-foreground ring-1 ring-inset ring-border">{r.channel?.name ?? "—"}</span> },
+            { key: "total", header: "Total", render: (r) => <div className="font-medium tabular-nums">{money(r.total)}</div> },
+            { key: "paid", header: "Paid", render: (r) => <div className="text-xs text-muted-foreground tabular-nums">{money(r.paidAmount)}</div> },
+            { key: "due", header: "Due", render: (r) => {
+              const due = num(r.total) - num(r.paidAmount);
+              return <div className={`text-xs font-medium tabular-nums ${due > 0 ? "text-red-600 dark:text-red-400" : "text-muted-foreground"}`}>{due > 0 ? money(due.toFixed(2)) : "—"}</div>;
+            } },
             { key: "paymentStatus", header: "Payment", render: (r) => <StatusBadge status={r.paymentStatus} /> },
             { key: "status", header: "Status", render: (r) => <StatusBadge status={r.status} /> },
-            { key: "date", header: "Date", render: (r) => <span className="text-xs text-muted-foreground">{formatDate(r.createdAt)}</span> },
+            { key: "date", header: "Date", render: (r) => <span className="text-xs text-muted-foreground whitespace-nowrap">{formatDate(r.createdAt)}</span> },
             { key: "actions", header: "", render: (r) => (
               <div className="flex gap-1" onClick={(e) => e.stopPropagation()}>
                 <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => openEdit(r)}><Pencil className="h-3.5 w-3.5" /></Button>

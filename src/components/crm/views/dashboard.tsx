@@ -148,6 +148,74 @@ export function DashboardView() {
         <StatCard label="Today's Profit" value={money(today?.profit)} icon={ArrowUpRight} tone={num(today?.profit) >= 0 ? "emerald" : "red"} sub="Revenue − COGS − costs" />
       </div>
 
+      {/* Financial Flow — visual: Sales → Payments → Costs → Profit */}
+      <Card className="shadow-soft card-hover">
+        <CardHeader className="pb-3">
+          <CardTitle className="text-base font-semibold tracking-tight">Business Flow <span className="text-muted-foreground font-normal text-xs">· how money moves today</span></CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="flex flex-col lg:flex-row items-stretch gap-3">
+            {/* Sales */}
+            <div className="flex-1 rounded-lg bg-emerald-500/8 border border-emerald-500/20 p-3">
+              <div className="flex items-center gap-2 text-emerald-700 dark:text-emerald-400">
+                <DollarSign className="h-4 w-4" />
+                <span className="text-xs font-semibold uppercase tracking-wider">Sales</span>
+              </div>
+              <p className="text-lg font-bold tabular-nums mt-1.5 text-emerald-700 dark:text-emerald-400">{money(today?.sales)}</p>
+              <p className="text-[11px] text-muted-foreground">{today?.orders ?? 0} orders</p>
+            </div>
+            {/* Arrow */}
+            <div className="hidden lg:flex items-center justify-center text-muted-foreground">
+              <ArrowDownRight className="h-4 w-4 rotate-[-90deg]" />
+            </div>
+            <div className="flex items-center justify-center lg:hidden text-muted-foreground">
+              <ArrowDownRight className="h-4 w-4" />
+            </div>
+            {/* Payments */}
+            <div className="flex-1 rounded-lg bg-cyan-500/8 border border-cyan-500/20 p-3">
+              <div className="flex items-center gap-2 text-cyan-700 dark:text-cyan-400">
+                <Wallet className="h-4 w-4" />
+                <span className="text-xs font-semibold uppercase tracking-wider">Payments</span>
+              </div>
+              <p className="text-lg font-bold tabular-nums mt-1.5 text-cyan-700 dark:text-cyan-400">{money(today?.payments)}</p>
+              <p className="text-[11px] text-muted-foreground">Cash + digital</p>
+            </div>
+            {/* Arrow */}
+            <div className="hidden lg:flex items-center justify-center text-muted-foreground">
+              <ArrowDownRight className="h-4 w-4 rotate-[-90deg]" />
+            </div>
+            <div className="flex items-center justify-center lg:hidden text-muted-foreground">
+              <ArrowDownRight className="h-4 w-4" />
+            </div>
+            {/* Costs */}
+            <div className="flex-1 rounded-lg bg-red-500/8 border border-red-500/20 p-3">
+              <div className="flex items-center gap-2 text-red-700 dark:text-red-400">
+                <TrendingDown className="h-4 w-4" />
+                <span className="text-xs font-semibold uppercase tracking-wider">Costs</span>
+              </div>
+              <p className="text-lg font-bold tabular-nums mt-1.5 text-red-700 dark:text-red-400">{money(today?.expenses)}</p>
+              <p className="text-[11px] text-muted-foreground">COGS + expenses</p>
+            </div>
+            {/* Arrow */}
+            <div className="hidden lg:flex items-center justify-center text-muted-foreground">
+              <ArrowDownRight className="h-4 w-4 rotate-[-90deg]" />
+            </div>
+            <div className="flex items-center justify-center lg:hidden text-muted-foreground">
+              <ArrowDownRight className="h-4 w-4" />
+            </div>
+            {/* Profit */}
+            <div className={`flex-1 rounded-lg p-3 border ${num(today?.profit) >= 0 ? "bg-emerald-500/8 border-emerald-500/20" : "bg-red-500/8 border-red-500/20"}`}>
+              <div className={`flex items-center gap-2 ${num(today?.profit) >= 0 ? "text-emerald-700 dark:text-emerald-400" : "text-red-700 dark:text-red-400"}`}>
+                <ArrowUpRight className="h-4 w-4" />
+                <span className="text-xs font-semibold uppercase tracking-wider">Profit</span>
+              </div>
+              <p className={`text-lg font-bold tabular-nums mt-1.5 ${num(today?.profit) >= 0 ? "text-emerald-700 dark:text-emerald-400" : "text-red-700 dark:text-red-400"}`}>{money(today?.profit)}</p>
+              <p className="text-[11px] text-muted-foreground">Net result</p>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
       {/* P&L summary */}
       <div className="grid lg:grid-cols-3 gap-4">
         <Card className="lg:col-span-2 shadow-soft card-hover">
@@ -301,4 +369,4 @@ function PnlRow({ label, value, negative, color, highlight }: { label: string; v
   );
 }
 
-void resolveRange; void Package; void TrendingDown; void ArrowDownRight;
+void resolveRange; void Package;
